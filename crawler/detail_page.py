@@ -1,15 +1,35 @@
 import json
 import re
 from datetime import date
+from pathlib import Path
 from typing import Any, Optional, Tuple
+from urllib.parse import urlsplit
 
 from bs4 import BeautifulSoup
 
-from config import BROWSER_CONFIG
+from config import BROWSER_CONFIG, PATHS
+from crawler.anti_detect import human_like_page_settle, human_like_read_pause, human_like_scroll
 
 
 class DetailPageBlockedError(RuntimeError):
     pass
+
+
+class DetailPageMismatchError(RuntimeError):
+    pass
+
+
+def _detail_debug_path(keyword: str, job_id: str, stage: str) -> Path:
+    safe_keyword = re.sub(r"[^a-zA-Z0-9_%\-]", "_", keyword)
+    safe_job_id = re.sub(r"[^0-9A-Za-z_\-]", "_", job_id)
+    PATHS["debug"].mkdir(parents=True, exist_ok=True)
+    return PATHS["debug"] / f"detail_{safe_keyword}_{safe_job_id}_{stage}.html"
+
+
+def write_detail_debug_html(keyword: str, job_id: str, stage: str, html: str) -> Path:
+    debug_file = _detail_debug_path(keyword, job_id, stage)
+    debug_file.write_text(html, encoding="utf-8")
+    return debug_file
 
 
 def _iter_job_postings(payload: Any):
@@ -31,8 +51,68 @@ def _iter_job_postings(payload: Any):
 
 
 def _load_json_safely(raw_text: str) -> Any:
-    cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", raw_text)
-    return json.loads(cleaned)
+    # Some ld+json blocks contain raw newlines inside quoted strings,
+    # which is invalid JSON but still semantically recoverable.
+    # Some pages also include bare backslashes like "C\C++\Python",
+    # which need to be escaped before json.loads().
+    cleaned: list[str] = []
+    in_string = False
+    index = 0
+
+    while index < len(raw_text):
+        char = raw_text[index]
+
+        if char == '"':
+            cleaned.append(char)
+            in_string = not in_string
+            index += 1
+            continue
+
+        if in_string:
+            if char == "\\":
+                next_char = raw_text[index + 1] if index + 1 < len(raw_text) else ""
+                if next_char in {'"', "\\", "/", "b", "f", "n", "r", "t"}:
+                    cleaned.append(char)
+                    cleaned.append(next_char)
+                    index += 2
+                    continue
+                if next_char == "u" and index + 5 < len(raw_text):
+                    cleaned.append(char)
+                    cleaned.append(next_char)
+                    index += 2
+                    continue
+                cleaned.append("\\\\")
+                index += 1
+                continue
+            if char == "\n":
+                cleaned.append("\\n")
+                index += 1
+                continue
+            if char == "\r":
+                cleaned.append("\\r")
+                index += 1
+                continue
+            if char == "\t":
+                cleaned.append("\\t")
+                index += 1
+                continue
+            if ord(char) < 0x20:
+                cleaned.append(" ")
+                index += 1
+                continue
+            cleaned.append(char)
+            index += 1
+            continue
+
+        if ord(char) < 0x20 and char not in {"\n", "\r", "\t"}:
+            cleaned.append(" ")
+            index += 1
+            continue
+
+        cleaned.append(char)
+        index += 1
+
+    return json.loads("".join(cleaned))
 
 
 def _parse_salary(text: Optional[str]) -> Tuple[Optional[int], Optional[int], Optional[int]]:
@@ -67,6 +147,22 @@ def _normalize_job_title(title: Optional[str]) -> Optional[str]:
     cleaned = re.sub(r"\s*-\s*\u730e\u8058.*$", "", title).strip()
     cleaned = re.sub(r"^\u3010[^\u3011]*\u3011", "", cleaned).strip()
     return cleaned or title
+
+
+def _expected_detail_url(job_id: str) -> str:
+    return f"https://www.liepin.com/a/{job_id}.shtml"
+
+
+def _normalized_url_path(url: Optional[str]) -> str:
+    if not url:
+        return ""
+    return urlsplit(url).path.rstrip("/")
+
+
+def _is_expected_detail_url(url: Optional[str], expected_detail_url: str) -> bool:
+    if not url or not expected_detail_url:
+        return False
+    return _normalized_url_path(url) == _normalized_url_path(expected_detail_url)
 
 
 def extract_from_ld_json(data: dict[str, Any]) -> dict[str, Any]:
@@ -151,6 +247,7 @@ def parse_detail_page(
 ) -> dict[str, Any]:
     soup = BeautifulSoup(html, "lxml")
     page_title = soup.title.get_text(strip=True) if soup.title else ""
+    found_job_posting = False
 
     if "\u9a8c\u8bc1\u7801" in page_title or "\u5b89\u5168\u4e2d\u5fc3" in page_title:
         raise DetailPageBlockedError("detail page was replaced by captcha")
@@ -169,14 +266,12 @@ def parse_detail_page(
             continue
 
         for posting in _iter_job_postings(payload):
+            found_job_posting = True
             job.update(extract_from_ld_json(posting))
             break
 
         if job.get("title"):
             break
-
-        if isinstance(payload, dict) and payload.get("title"):
-            job.update(extract_from_generic_ld_json(payload))
 
     time_factor = soup.select_one(".time-factor-wrap")
     if time_factor:
@@ -202,23 +297,59 @@ def parse_detail_page(
     if not job.get("jd_length") and job.get("jd_text"):
         job["jd_length"] = len(job["jd_text"])
 
+    if not found_job_posting:
+        raise DetailPageMismatchError("detail page is not a job posting page")
+
     if not job.get("title"):
         raise ValueError("detail page parsed but title is still missing")
 
     return job
 
 
-async def fetch_detail_page(page, job_id: str, keyword: str) -> dict[str, Any]:
-    detail_url = f"https://www.liepin.com/a/{job_id}.shtml"
-    await page.goto(
-        detail_url,
-        wait_until="networkidle",
-        timeout=BROWSER_CONFIG["goto_timeout_ms"],
-    )
+async def parse_current_detail_page(
+    page,
+    job_id: str,
+    keyword: str,
+    detail_url: str,
+) -> dict[str, Any]:
+    await human_like_page_settle(page)
+    await human_like_read_pause(page)
+    await human_like_scroll(page)
     html = await page.content()
-    return parse_detail_page(
-        html=html,
-        job_id=job_id,
-        detail_url=detail_url,
-        keyword=keyword,
-    )
+    if not _is_expected_detail_url(page.url, detail_url):
+        write_detail_debug_html(keyword, job_id, "wrong_page", html)
+        raise DetailPageMismatchError(
+            f"detail page landed on unexpected url: {page.url}"
+        )
+    try:
+        return parse_detail_page(
+            html=html,
+            job_id=job_id,
+            detail_url=detail_url,
+            keyword=keyword,
+        )
+    except DetailPageBlockedError:
+        write_detail_debug_html(keyword, job_id, "blocked", html)
+        raise
+    except Exception:
+        write_detail_debug_html(keyword, job_id, "parse_failed", html)
+        raise
+
+
+async def fetch_detail_page(
+    page,
+    job_id: str,
+    keyword: str,
+    detail_url: str,
+    *,
+    referer: Optional[str] = None,
+) -> dict[str, Any]:
+    goto_kwargs = {
+        "wait_until": "networkidle",
+        "timeout": BROWSER_CONFIG["goto_timeout_ms"],
+    }
+    if referer:
+        goto_kwargs["referer"] = referer
+
+    await page.goto(detail_url, **goto_kwargs)
+    return await parse_current_detail_page(page, job_id, keyword, detail_url)

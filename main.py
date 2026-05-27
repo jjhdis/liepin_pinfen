@@ -1,14 +1,31 @@
 import argparse
 import asyncio
 import time
-from typing import Optional
 
-from config import PATHS, SEARCH_CONFIG
-from crawler.anti_detect import random_delay
+from config import PATHS, RUN_CONFIG
+from crawler.anti_detect import human_like_page_settle, random_delay
 from crawler.browser import open_browser
-from crawler.detail_page import DetailPageBlockedError, fetch_detail_page
-from crawler.list_page import ListPageBlockedError, build_search_url, scrape_list_page
+from crawler.detail_page import (
+    DetailPageBlockedError,
+    DetailPageMismatchError,
+    fetch_detail_page,
+)
+from crawler.list_page import (
+    ListPageBlockedError,
+    build_search_url,
+    open_search_page,
+    scrape_list_job_cards,
+)
 from storage.database import Database
+
+
+def _add_interactive_arg(parser: argparse.ArgumentParser, default: bool) -> None:
+    parser.add_argument(
+        "--interactive",
+        action=argparse.BooleanOptionalAction,
+        default=default,
+        help="Ask for confirmation before or during batch processing.",
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -19,19 +36,24 @@ def parse_args() -> argparse.Namespace:
 
     list_parser = subparsers.add_parser("list", help="Fetch one or more list pages only.")
     list_parser.add_argument("--keyword", required=True, help="Search keyword, e.g. python")
-    list_parser.add_argument("--page", type=int, default=0, help="Start page number, 0-based.")
-    list_parser.add_argument("--pages", type=int, default=1, help="How many pages to fetch.")
-    list_parser.add_argument("--min-delay", type=float, default=120.0)
-    list_parser.add_argument("--max-delay", type=float, default=300.0)
-    list_parser.add_argument("--interactive", action="store_true")
+    list_parser.add_argument("--page", type=int, default=RUN_CONFIG["list"]["page"], help="Start page number, 0-based.")
+    list_parser.add_argument("--pages", type=int, default=RUN_CONFIG["list"]["pages"], help="How many pages to fetch.")
+    list_parser.add_argument("--min-delay", type=float, default=RUN_CONFIG["list"]["min_delay"])
+    list_parser.add_argument("--max-delay", type=float, default=RUN_CONFIG["list"]["max_delay"])
+    _add_interactive_arg(list_parser, RUN_CONFIG["list"]["interactive"])
 
     detail_parser = subparsers.add_parser("detail", help="Fetch a small batch of pending detail pages.")
     detail_parser.add_argument("--keyword", help="Optional keyword filter.")
-    detail_parser.add_argument("--max-detail", type=int, default=3)
-    detail_parser.add_argument("--min-delay", type=float, default=20.0)
-    detail_parser.add_argument("--max-delay", type=float, default=60.0)
-    detail_parser.add_argument("--interactive", action="store_true")
-    detail_parser.add_argument("--confirm-every", type=int, default=1)
+    detail_parser.add_argument("--max-detail", type=int, default=RUN_CONFIG["detail"]["max_detail"])
+    detail_parser.add_argument("--min-delay", type=float, default=RUN_CONFIG["detail"]["min_delay"])
+    detail_parser.add_argument("--max-delay", type=float, default=RUN_CONFIG["detail"]["max_delay"])
+    _add_interactive_arg(detail_parser, RUN_CONFIG["detail"]["interactive"])
+    detail_parser.add_argument("--startup-cooldown-min", type=float, default=RUN_CONFIG["detail"]["startup_cooldown_min"])
+    detail_parser.add_argument("--startup-cooldown-max", type=float, default=RUN_CONFIG["detail"]["startup_cooldown_max"])
+    detail_parser.add_argument("--confirm-every", type=int, default=RUN_CONFIG["detail"]["confirm_every"])
+    detail_parser.add_argument("--cooldown-every", type=int, default=RUN_CONFIG["detail"]["cooldown_every"])
+    detail_parser.add_argument("--cooldown-min", type=float, default=RUN_CONFIG["detail"]["cooldown_min"])
+    detail_parser.add_argument("--cooldown-max", type=float, default=RUN_CONFIG["detail"]["cooldown_max"])
 
     return parser.parse_args()
 
@@ -57,7 +79,7 @@ async def run_list_mode(args: argparse.Namespace, database: Database) -> None:
             list_started = time.perf_counter()
 
             try:
-                job_ids = await scrape_list_page(page, args.keyword, page_no)
+                job_cards = await scrape_list_job_cards(page, args.keyword, page_no)
                 list_latency = time.perf_counter() - list_started
                 database.log_crawl(
                     url=list_url,
@@ -98,9 +120,9 @@ async def run_list_mode(args: argparse.Namespace, database: Database) -> None:
                 print(f"[list-failed] keyword={args.keyword} page={page_no} error={exc}")
                 return
 
-            print(f"[list] keyword={args.keyword} page={page_no} job_ids={len(job_ids)}")
+            print(f"[list] keyword={args.keyword} page={page_no} job_ids={len(job_cards)}")
 
-            if not job_ids:
+            if not job_cards:
                 database.log_crawl(
                     url=list_url,
                     keyword=args.keyword,
@@ -114,11 +136,11 @@ async def run_list_mode(args: argparse.Namespace, database: Database) -> None:
                 )
                 return
 
-            for job_id in job_ids:
+            for item in job_cards:
                 database.insert_job_stub(
-                    job_id=job_id,
+                    job_id=item["job_id"],
                     keyword=args.keyword,
-                    detail_url=f"https://www.liepin.com/a/{job_id}.shtml",
+                    detail_url=item["detail_url"],
                 )
 
             print(
@@ -150,6 +172,12 @@ async def run_detail_mode(args: argparse.Namespace, database: Database) -> None:
         print("[detail-cancelled] user declined before start")
         return
 
+    startup_cooldown_seconds = await random_delay(
+        args.startup_cooldown_min,
+        args.startup_cooldown_max,
+    )
+    print(f"[detail-startup-cooldown] sleep_seconds={startup_cooldown_seconds:.1f}")
+
     async with open_browser() as (_, context):
         page = await context.new_page()
         processed = 0
@@ -166,7 +194,16 @@ async def run_detail_mode(args: argparse.Namespace, database: Database) -> None:
                     return
 
             try:
-                job = await fetch_detail_page(page, job_id, keyword)
+                await open_search_page(page, keyword, 0)
+                await human_like_page_settle(page)
+                job = await fetch_detail_page(
+                    page,
+                    job_id,
+                    keyword,
+                    detail_url,
+                    referer=page.url,
+                )
+                path = "search_warmup_then_direct_goto"
                 database.upsert_job(job)
                 database.log_crawl(
                     url=detail_url,
@@ -177,9 +214,13 @@ async def run_detail_mode(args: argparse.Namespace, database: Database) -> None:
                     latency_seconds=time.perf_counter() - detail_started,
                     retry_count=0,
                     success=True,
+                    error_message=None,
                 )
-                print(f"[detail] job_id={job_id} title={job.get('title')}")
-            except DetailPageBlockedError as exc:
+                print(
+                    f"[detail] job_id={job_id} title={job.get('title')} "
+                    f"path={path}"
+                )
+            except (DetailPageBlockedError, DetailPageMismatchError) as exc:
                 database.log_crawl(
                     url=detail_url,
                     keyword=keyword,
@@ -208,8 +249,18 @@ async def run_detail_mode(args: argparse.Namespace, database: Database) -> None:
                 print(f"[detail-failed] job_id={job_id} error={exc}")
 
             processed += 1
-            if processed != len(pending_jobs):
-                await random_delay(args.min_delay, args.max_delay)
+            if processed == len(pending_jobs):
+                continue
+
+            if args.cooldown_every > 0 and processed % args.cooldown_every == 0:
+                cooldown_seconds = await random_delay(args.cooldown_min, args.cooldown_max)
+                print(
+                    f"[detail-cooldown] processed={processed} "
+                    f"sleep_seconds={cooldown_seconds:.1f}"
+                )
+                continue
+
+            await random_delay(args.min_delay, args.max_delay)
 
 
 async def async_main(args: argparse.Namespace) -> None:
