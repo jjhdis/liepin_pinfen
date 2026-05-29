@@ -1,0 +1,49 @@
+{
+  "request": {
+    "method": "GET",
+    "url": "https://www.zhihu.com/api/v4/search_v3?gk_version=gz-gaokao&t=general&correction=1&offset=0&limit=20&filter_fields=&lc_idx=0&show_all_topics=0&search_source=Normal&q=%E4%B8%8A%E6%B5%B7%E5%8D%8E%E9%92%A6%E4%BF%A1%E6%81%AF%E7%A7%91%E6%8A%80%E8%82%A1%E4%BB%BD%E6%9C%89%E9%99%90%E5%85%AC%E5%8F%B8",
+    "headers": {
+      "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+      "accept": "*/*",
+      "accept-language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+      "accept-encoding": "gzip, deflate, br, zstd",
+      "cache-control": "no-cache",
+      "pragma": "no-cache",
+      "x-requested-with": "fetch",
+      "x-zse-93": "101_3_3.0",
+      "x-zse-96": "2.0_kKQduB8xIT0FpvrKj6KU1aFkRu4I9g2i9RBuGYuke1/abFNuDIobbApByM3Lr2+0",
+      "x-api-version": "3.0.91",
+      "x-app-za": "OS=Web",
+      "sec-ch-ua": "\"Chromium\";v=\"148\", \"Microsoft Edge\";v=\"148\", \"Not/A)Brand\";v=\"99\"",
+      "sec-ch-ua-mobile": "?0",
+      "sec-ch-ua-platform": "\"Windows\"",
+      "sec-fetch-dest": "empty",
+      "sec-fetch-mode": "cors",
+      "sec-fetch-site": "same-origin",
+      "referer": "https://www.zhihu.com/search?q=%E4%B8%8A%E6%B5%B7%E5%8D%8E%E9%92%A6%E4%BF%A1%E6%81%AF%E7%A7%91%E6%8A%80%E8%82%A1%E4%BB%BD%E6%9C%89%E9%99%90%E5%85%AC%E5%8F%B8&type=content",
+      "origin": "https://www.zhihu.com"
+    }
+  },
+  "response": {
+    "status_code": 400,
+    "headers": {
+      "server": "BLB/25.11.0.2",
+      "content-type": "application/json",
+      "zhi-request-id": "11356869952325248871",
+      "expires": "Thu, 01 Jan 1970 08:00:00 CST",
+      "pragma": "no-cache",
+      "vary": "Accept-Encoding",
+      "x-dayu-backend-response": "0.038",
+      "referrer-policy": "no-referrer-when-downgrade",
+      "x-secng-response": "0.053000211715698",
+      "cache-control": "private, must-revalidate, no-cache, no-store, max-age=0",
+      "age": "0",
+      "content-length": "19",
+      "date": "Fri, 29 May 2026 06:29:20 GMT",
+      "alt-svc": "h3=\":443\"; ma=2592000,h3-29=\":443\"; ma=2592000,h3-Q050=\":443\"; ma=2592000,quic=\":443\"; ma=2592000; v=\"46,43\"",
+      "eo-log-uuid": "11356869952325248871",
+      "eo-cache-status": "MISS"
+    },
+    "text": "{\"HitLabels\":null}\n"
+  }
+}

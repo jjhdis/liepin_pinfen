@@ -63,6 +63,16 @@ def _load_json_safely(raw_text: str) -> Any:
         char = raw_text[index]
 
         if char == '"':
+            if in_string:
+                next_non_whitespace = index + 1
+                while next_non_whitespace < len(raw_text) and raw_text[next_non_whitespace] in {" ", "\n", "\r", "\t"}:
+                    next_non_whitespace += 1
+                if next_non_whitespace < len(raw_text):
+                    next_char = raw_text[next_non_whitespace]
+                    if next_char not in {",", "}", "]", ":"}:
+                        cleaned.append('\\"')
+                        index += 1
+                        continue
             cleaned.append(char)
             in_string = not in_string
             index += 1
@@ -115,6 +125,10 @@ def _load_json_safely(raw_text: str) -> Any:
     return json.loads("".join(cleaned))
 
 
+def _contains_job_posting_marker(raw_text: str) -> bool:
+    return '"@type"' in raw_text and '"JobPosting"' in raw_text
+
+
 def _parse_salary(text: Optional[str]) -> Tuple[Optional[int], Optional[int], Optional[int]]:
     if not text:
         return None, None, None
@@ -147,6 +161,22 @@ def _normalize_job_title(title: Optional[str]) -> Optional[str]:
     cleaned = re.sub(r"\s*-\s*\u730e\u8058.*$", "", title).strip()
     cleaned = re.sub(r"^\u3010[^\u3011]*\u3011", "", cleaned).strip()
     return cleaned or title
+
+
+def _extract_job_properties_last_updated(soup: BeautifulSoup) -> Optional[str]:
+    node = soup.select_one(".job-properties")
+    if not node:
+        return None
+
+    text = node.get_text(" ", strip=True)
+    month_day_match = re.search(r"(\d{1,2})月(\d{1,2})日更新", text)
+    if not month_day_match:
+        return None
+
+    today = date.today()
+    month = int(month_day_match.group(1))
+    day = int(month_day_match.group(2))
+    return f"{today.year:04d}-{month:02d}-{day:02d}"
 
 
 def _expected_detail_url(job_id: str) -> str:
@@ -248,6 +278,7 @@ def parse_detail_page(
     soup = BeautifulSoup(html, "lxml")
     page_title = soup.title.get_text(strip=True) if soup.title else ""
     found_job_posting = False
+    found_job_posting_marker = False
 
     if "\u9a8c\u8bc1\u7801" in page_title or "\u5b89\u5168\u4e2d\u5fc3" in page_title:
         raise DetailPageBlockedError("detail page was replaced by captcha")
@@ -260,8 +291,11 @@ def parse_detail_page(
     }
 
     for tag in soup.find_all("script", type="application/ld+json"):
+        raw_ld_json = tag.get_text()
+        if _contains_job_posting_marker(raw_ld_json):
+            found_job_posting_marker = True
         try:
-            payload = _load_json_safely(tag.get_text())
+            payload = _load_json_safely(raw_ld_json)
         except (json.JSONDecodeError, TypeError):
             continue
 
@@ -273,8 +307,15 @@ def parse_detail_page(
         if job.get("title"):
             break
 
+    # Prefer the inline job-properties update date because it more closely
+    # matches the visible listing freshness signal than the generic page-level
+    # time-factor block.
+    properties_last_updated = _extract_job_properties_last_updated(soup)
+    if properties_last_updated:
+        job["last_updated"] = properties_last_updated
+
     time_factor = soup.select_one(".time-factor-wrap")
-    if time_factor:
+    if time_factor and not job.get("last_updated"):
         match = re.search(r"\d{4}-\d{2}-\d{2}", time_factor.get_text(" ", strip=True))
         if match:
             job["last_updated"] = match.group()
@@ -298,6 +339,8 @@ def parse_detail_page(
         job["jd_length"] = len(job["jd_text"])
 
     if not found_job_posting:
+        if found_job_posting_marker:
+            raise ValueError("detail page contains JobPosting ld+json but it could not be parsed")
         raise DetailPageMismatchError("detail page is not a job posting page")
 
     if not job.get("title"):
