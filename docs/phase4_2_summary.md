@@ -95,8 +95,8 @@
 当前规则：
 
 1. 摘要命中负面词 -> 直接保留
-2. 标题命中负面词，摘要没命中 -> 保留，并标记 `need_expand_fulltext = 1`
-3. 标题命中中立触发词（如“怎么样”“用户评价”），摘要没命中 -> 保留，并标记 `need_expand_fulltext = 1`
+2. 标题命中负面词，摘要没命中 -> 保留
+3. 标题命中中立触发词（如“怎么样”“用户评价”），摘要没命中 -> 保留
 4. 标题和摘要都不命中 -> 跳过
 
 ### 6. 当前有效输出已简化为单一证据数组
@@ -111,16 +111,17 @@
 
 每条证据当前包含：
 
-- `type`
-- `id`
+- `schema_version`
+- `evidence_id`
+- `content_type`
+- `content_id`
 - `url`
 - `title`
-- `excerpt`
+- `description`
+- `match_type`
 - `matched_in`
 - `matched_keyword`
-- `matched_snippet`
 - `reason`
-- `need_expand_fulltext`
 
 当前其余字段暂时保留，但不作为本阶段核心输出：
 

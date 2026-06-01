@@ -94,7 +94,8 @@ ZHIHU_CONFIG = {
         "show_all_topics": 0,
         "search_source": "Normal",
     },
-    "summary_top_n": 3,
+    "summary_top_n": 10,
+    "filtered_top_n": 3,
     "search_delay_min": 5.0,
     "search_delay_max": 10.0,
     "max_requests_per_run": 20,
@@ -122,8 +123,8 @@ AI_CONFIG = {
     "temperature": 0.1,
     "max_tokens": 900,
     "request_timeout_seconds": 120.0,
-    "batch_size": 5,
-    "max_days_since_update": 7,
+    "batch_size": 50,
+    "max_days_since_update": 14,
 }
 
 SCORE_THRESHOLD = 60

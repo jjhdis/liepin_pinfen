@@ -379,6 +379,8 @@ def ensure_cleaned_table(db_path: Path) -> None:
                 status TEXT NOT NULL DEFAULT 'pending',
                 source TEXT,
                 query TEXT,
+                zhihu_raw_results_json TEXT NOT NULL DEFAULT '[]',
+                zhihu_filtered_results_json TEXT NOT NULL DEFAULT '[]',
                 search_results_json TEXT NOT NULL DEFAULT '[]',
                 negative_sentences_json TEXT NOT NULL DEFAULT '[]',
                 risk_level TEXT,
@@ -390,6 +392,15 @@ def ensure_cleaned_table(db_path: Path) -> None:
             )
             """
         )
+        company_columns = _table_info(conn, "company_enriched")
+        if "zhihu_raw_results_json" not in company_columns:
+            conn.execute(
+                "ALTER TABLE company_enriched ADD COLUMN zhihu_raw_results_json TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "zhihu_filtered_results_json" not in company_columns:
+            conn.execute(
+                "ALTER TABLE company_enriched ADD COLUMN zhihu_filtered_results_json TEXT NOT NULL DEFAULT '[]'"
+            )
         conn.execute(
             f"""
             UPDATE jobs

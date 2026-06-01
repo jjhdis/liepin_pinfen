@@ -296,6 +296,8 @@ class Database:
                     status TEXT NOT NULL DEFAULT 'pending',
                     source TEXT,
                     query TEXT,
+                    zhihu_raw_results_json TEXT NOT NULL DEFAULT '[]',
+                    zhihu_filtered_results_json TEXT NOT NULL DEFAULT '[]',
                     search_results_json TEXT NOT NULL DEFAULT '[]',
                     negative_sentences_json TEXT NOT NULL DEFAULT '[]',
                     risk_level TEXT,
@@ -365,6 +367,15 @@ class Database:
                 )
                 if _needs_jobs_cleaned_rebuild(cleaned_columns):
                     _rebuild_jobs_cleaned_table(conn)
+            company_columns = _table_info(conn, "company_enriched")
+            if "zhihu_raw_results_json" not in company_columns:
+                conn.execute(
+                    "ALTER TABLE company_enriched ADD COLUMN zhihu_raw_results_json TEXT NOT NULL DEFAULT '[]'"
+                )
+            if "zhihu_filtered_results_json" not in company_columns:
+                conn.execute(
+                    "ALTER TABLE company_enriched ADD COLUMN zhihu_filtered_results_json TEXT NOT NULL DEFAULT '[]'"
+                )
             conn.commit()
 
     def job_exists(self, job_id: str) -> bool:
@@ -448,12 +459,16 @@ class Database:
                 c.keyword,
                 c.last_updated,
                 c.days_since_update,
+                c.company_name_norm,
                 c.ai_input_json,
                 c.quality_flags_json,
                 c.clean_status,
-                c.score_status
+                c.score_status,
+                ce.risk_level AS company_risk_level,
+                ce.zhihu_filtered_results_json
             FROM jobs_cleaned c
             LEFT JOIN scores s ON s.job_id = c.job_id
+            LEFT JOIN company_enriched ce ON ce.company_name_norm = c.company_name_norm
             WHERE c.ai_input_json IS NOT NULL
               AND TRIM(c.ai_input_json) <> ''
               AND c.clean_status = 1
@@ -571,6 +586,12 @@ class Database:
             "status": payload.get("status", "done"),
             "source": payload.get("source"),
             "query": payload.get("query"),
+            "zhihu_raw_results_json": json.dumps(
+                payload.get("zhihu_raw_results", []), ensure_ascii=False
+            ),
+            "zhihu_filtered_results_json": json.dumps(
+                payload.get("zhihu_filtered_results", []), ensure_ascii=False
+            ),
             "search_results_json": json.dumps(
                 payload.get("search_results", []), ensure_ascii=False
             ),
@@ -592,10 +613,12 @@ class Database:
                 """
                 INSERT INTO company_enriched (
                     company_name_norm, company_name_raw, status, source, query,
+                    zhihu_raw_results_json, zhihu_filtered_results_json,
                     search_results_json, negative_sentences_json, risk_level,
                     risk_reasons_json, last_checked_at, expire_at, created_at, updated_at
                 ) VALUES (
                     :company_name_norm, :company_name_raw, :status, :source, :query,
+                    :zhihu_raw_results_json, :zhihu_filtered_results_json,
                     :search_results_json, :negative_sentences_json, :risk_level,
                     :risk_reasons_json, :last_checked_at, :expire_at, :created_at, :updated_at
                 )
@@ -604,6 +627,8 @@ class Database:
                     status = excluded.status,
                     source = excluded.source,
                     query = excluded.query,
+                    zhihu_raw_results_json = excluded.zhihu_raw_results_json,
+                    zhihu_filtered_results_json = excluded.zhihu_filtered_results_json,
                     search_results_json = excluded.search_results_json,
                     negative_sentences_json = excluded.negative_sentences_json,
                     risk_level = excluded.risk_level,
