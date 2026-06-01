@@ -7,6 +7,8 @@ from crawler.anti_detect import human_like_page_settle, random_delay
 from crawler.browser import open_browser
 from crawler.detail_page import (
     DetailPageBlockedError,
+    DetailPageExpiredError,
+    DetailPageLoginRequiredError,
     DetailPageMismatchError,
     fetch_detail_page,
 )
@@ -220,7 +222,7 @@ async def run_detail_mode(args: argparse.Namespace, database: Database) -> None:
                     f"[detail] job_id={job_id} title={job.get('title')} "
                     f"path={path}"
                 )
-            except (DetailPageBlockedError, DetailPageMismatchError) as exc:
+            except (DetailPageBlockedError, DetailPageLoginRequiredError) as exc:
                 database.log_crawl(
                     url=detail_url,
                     keyword=keyword,
@@ -234,6 +236,20 @@ async def run_detail_mode(args: argparse.Namespace, database: Database) -> None:
                 )
                 print(f"[detail-blocked] job_id={job_id} error={exc}")
                 return
+            except (DetailPageMismatchError, DetailPageExpiredError) as exc:
+                database.log_crawl(
+                    url=detail_url,
+                    keyword=keyword,
+                    page_no=None,
+                    job_id=job_id,
+                    status_code=None,
+                    latency_seconds=time.perf_counter() - detail_started,
+                    retry_count=0,
+                    success=False,
+                    error_message=str(exc),
+                )
+                database.delete_job(job_id)
+                print(f"[detail-skip] job_id={job_id} error={exc}")
             except Exception as exc:
                 database.log_crawl(
                     url=detail_url,

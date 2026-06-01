@@ -19,6 +19,14 @@ class DetailPageMismatchError(RuntimeError):
     pass
 
 
+class DetailPageExpiredError(RuntimeError):
+    pass
+
+
+class DetailPageLoginRequiredError(RuntimeError):
+    pass
+
+
 def _detail_debug_path(keyword: str, job_id: str, stage: str) -> Path:
     safe_keyword = re.sub(r"[^a-zA-Z0-9_%\-]", "_", keyword)
     safe_job_id = re.sub(r"[^0-9A-Za-z_\-]", "_", job_id)
@@ -189,6 +197,20 @@ def _normalized_url_path(url: Optional[str]) -> str:
     return urlsplit(url).path.rstrip("/")
 
 
+def _is_login_intercept_page(url: Optional[str], html: str) -> bool:
+    if not url:
+        return False
+    lowered_url = url.lower()
+    lowered_html = html.lower()
+    return (
+        "wow.liepin.com" in lowered_url
+        or "/t1012695/" in lowered_url
+        or "登录/注册" in html
+        or "login-submit-btn" in lowered_html
+        or "data-nick=\"login-phone\"" in lowered_html
+    )
+
+
 def _is_expected_detail_url(url: Optional[str], expected_detail_url: str) -> bool:
     if not url or not expected_detail_url:
         return False
@@ -279,9 +301,17 @@ def parse_detail_page(
     page_title = soup.title.get_text(strip=True) if soup.title else ""
     found_job_posting = False
     found_job_posting_marker = False
+    page_text = soup.get_text(" ", strip=True)
 
     if "\u9a8c\u8bc1\u7801" in page_title or "\u5b89\u5168\u4e2d\u5fc3" in page_title:
         raise DetailPageBlockedError("detail page was replaced by captcha")
+
+    if (
+        "job-expired" in html
+        or "www/job-expired" in html
+        or "\u6d4f\u89c8\u66f4\u591a\u4f18\u8d28\u804c\u4f4d" in page_text
+    ):
+        raise DetailPageExpiredError("detail page is expired or no longer available")
 
     job: dict[str, Any] = {
         "job_id": job_id,
@@ -359,6 +389,11 @@ async def parse_current_detail_page(
     await human_like_read_pause(page)
     await human_like_scroll(page)
     html = await page.content()
+    if _is_login_intercept_page(page.url, html):
+        write_detail_debug_html(keyword, job_id, "login_required", html)
+        raise DetailPageLoginRequiredError(
+            f"detail page was intercepted by login page: {page.url}"
+        )
     if not _is_expected_detail_url(page.url, detail_url):
         write_detail_debug_html(keyword, job_id, "wrong_page", html)
         raise DetailPageMismatchError(
@@ -373,6 +408,12 @@ async def parse_current_detail_page(
         )
     except DetailPageBlockedError:
         write_detail_debug_html(keyword, job_id, "blocked", html)
+        raise
+    except DetailPageExpiredError:
+        write_detail_debug_html(keyword, job_id, "expired", html)
+        raise
+    except DetailPageMismatchError:
+        write_detail_debug_html(keyword, job_id, "wrong_page", html)
         raise
     except Exception:
         write_detail_debug_html(keyword, job_id, "parse_failed", html)

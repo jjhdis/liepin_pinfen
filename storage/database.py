@@ -864,3 +864,28 @@ class Database:
                 (clean_status, datetime.utcnow().isoformat(timespec="seconds"), job_id),
             )
             conn.commit()
+
+    def delete_job(self, job_id: str) -> None:
+        with closing(self.connect()) as conn:
+            conn.execute(
+                """
+                DELETE FROM scores
+                WHERE job_id = ?
+                """,
+                (job_id,),
+            )
+            conn.execute(
+                """
+                DELETE FROM jobs_cleaned
+                WHERE job_id = ?
+                """,
+                (job_id,),
+            )
+            conn.execute(
+                """
+                DELETE FROM jobs
+                WHERE job_id = ?
+                """,
+                (job_id,),
+            )
+            conn.commit()
