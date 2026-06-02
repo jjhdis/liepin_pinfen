@@ -187,6 +187,18 @@ def _extract_job_properties_last_updated(soup: BeautifulSoup) -> Optional[str]:
     return f"{today.year:04d}-{month:02d}-{day:02d}"
 
 
+def _normalize_iso_date(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    match = re.match(r"^(\d{4}-\d{2}-\d{2})", text)
+    if match:
+        return match.group(1)
+    return None
+
+
 def _expected_detail_url(job_id: str) -> str:
     return f"https://www.liepin.com/a/{job_id}.shtml"
 
@@ -208,6 +220,22 @@ def _is_login_intercept_page(url: Optional[str], html: str) -> bool:
         or "登录/注册" in html
         or "login-submit-btn" in lowered_html
         or "data-nick=\"login-phone\"" in lowered_html
+    )
+
+
+def _is_security_intercept_page(url: Optional[str], html: str) -> bool:
+    if not url:
+        return False
+    lowered_url = url.lower()
+    lowered_html = html.lower()
+    return (
+        "safe.liepin.com" in lowered_url
+        or "/v/intercept/" in lowered_url
+        or "verifysms" in lowered_url
+        or "手机验证" in html
+        or "短信验证" in html
+        or "验证手机号" in html
+        or "verifysms" in lowered_html
     )
 
 
@@ -241,6 +269,8 @@ def extract_from_ld_json(data: dict[str, Any]) -> dict[str, Any]:
             address = first_location.get("address") or {}
 
     salary_min, salary_max, salary_months = _parse_salary(salary_text)
+    date_posted = _normalize_iso_date(data.get("datePosted"))
+    last_updated = _normalize_iso_date(data.get("validThrough")) or date_posted
 
     return {
         "title": _normalize_job_title(data.get("title")),
@@ -250,8 +280,8 @@ def extract_from_ld_json(data: dict[str, Any]) -> dict[str, Any]:
         "city": address.get("addressLocality"),
         "exp_years": data.get("experienceRequirements"),
         "education": data.get("educationRequirements"),
-        "date_posted": data.get("datePosted"),
-        "last_updated": data.get("validThrough") or data.get("datePosted"),
+        "date_posted": date_posted,
+        "last_updated": last_updated,
         "company_name": hiring_org.get("name"),
         "company_verified": bool(hiring_org.get("sameAs")),
         "company_logo_exists": bool(hiring_org.get("logo")),
@@ -265,13 +295,8 @@ def extract_from_ld_json(data: dict[str, Any]) -> dict[str, Any]:
 def extract_from_generic_ld_json(data: dict[str, Any]) -> dict[str, Any]:
     description = _normalize_text(data.get("description"))
     title = data.get("title")
-    date_posted = data.get("pubDate")
-    last_updated = data.get("upDate")
-
-    if isinstance(date_posted, str):
-        date_posted = date_posted[:10]
-    if isinstance(last_updated, str):
-        last_updated = last_updated[:10]
+    date_posted = _normalize_iso_date(data.get("pubDate"))
+    last_updated = _normalize_iso_date(data.get("upDate"))
 
     salary_min = salary_max = None
     salary_match = re.search(r"\u85aa\u8d44(\d+)-(\d+)k", description, re.IGNORECASE)
@@ -389,6 +414,11 @@ async def parse_current_detail_page(
     await human_like_read_pause(page)
     await human_like_scroll(page)
     html = await page.content()
+    if _is_security_intercept_page(page.url, html):
+        write_detail_debug_html(keyword, job_id, "blocked", html)
+        raise DetailPageBlockedError(
+            f"detail page was intercepted by security verification: {page.url}"
+        )
     if _is_login_intercept_page(page.url, html):
         write_detail_debug_html(keyword, job_id, "login_required", html)
         raise DetailPageLoginRequiredError(

@@ -105,7 +105,7 @@ async def run_list_mode(args: argparse.Namespace, database: Database) -> None:
                     success=False,
                     error_message=str(exc),
                 )
-                print(f"[list-blocked] keyword={args.keyword} page={page_no} error={exc}")
+                print(f"[list-stop] keyword={args.keyword} page={page_no} reason=blocked error={exc}")
                 return
             except Exception as exc:
                 database.log_crawl(
@@ -122,7 +122,10 @@ async def run_list_mode(args: argparse.Namespace, database: Database) -> None:
                 print(f"[list-failed] keyword={args.keyword} page={page_no} error={exc}")
                 return
 
-            print(f"[list] keyword={args.keyword} page={page_no} job_ids={len(job_cards)}")
+            print(
+                f"[list-success] keyword={args.keyword} page={page_no} "
+                f"job_ids={len(job_cards)}"
+            )
 
             if not job_cards:
                 database.log_crawl(
@@ -136,6 +139,10 @@ async def run_list_mode(args: argparse.Namespace, database: Database) -> None:
                     success=False,
                     error_message="no job ids extracted; saved debug html",
                 )
+                print(
+                    f"[list-failed] keyword={args.keyword} page={page_no} "
+                    f"error=no job ids extracted; saved debug html"
+                )
                 return
 
             for item in job_cards:
@@ -146,8 +153,8 @@ async def run_list_mode(args: argparse.Namespace, database: Database) -> None:
                 )
 
             print(
-                f"[list-stored] keyword={args.keyword} page={page_no} "
-                f"pending_total={database.pending_job_count(keyword=args.keyword)}"
+                f"[list-success] keyword={args.keyword} page={page_no} "
+                f"pending_total={database.pending_job_count(keyword=args.keyword)} action=stored"
             )
 
             if args.interactive and page_offset != args.pages - 1:
@@ -196,6 +203,7 @@ async def run_detail_mode(args: argparse.Namespace, database: Database) -> None:
                     return
 
             try:
+                database.update_detail_status(job_id, status="pending", error_message=None)
                 await open_search_page(page, keyword, 0)
                 await human_like_page_settle(page)
                 job = await fetch_detail_page(
@@ -219,10 +227,12 @@ async def run_detail_mode(args: argparse.Namespace, database: Database) -> None:
                     error_message=None,
                 )
                 print(
-                    f"[detail] job_id={job_id} title={job.get('title')} "
-                    f"path={path}"
+                    f"[detail-success] job_id={job_id} title={job.get('title')} "
+                    f"status=success path={path}"
                 )
             except (DetailPageBlockedError, DetailPageLoginRequiredError) as exc:
+                status = "blocked" if isinstance(exc, DetailPageBlockedError) else "login_required"
+                database.update_detail_status(job_id, status=status, error_message=str(exc))
                 database.log_crawl(
                     url=detail_url,
                     keyword=keyword,
@@ -234,9 +244,26 @@ async def run_detail_mode(args: argparse.Namespace, database: Database) -> None:
                     success=False,
                     error_message=str(exc),
                 )
-                print(f"[detail-blocked] job_id={job_id} error={exc}")
+                print(f"[detail-stop] job_id={job_id} status={status} error={exc}")
+                return
+            except ListPageBlockedError as exc:
+                database.update_detail_status(job_id, status="blocked", error_message=str(exc))
+                database.log_crawl(
+                    url=detail_url,
+                    keyword=keyword,
+                    page_no=None,
+                    job_id=job_id,
+                    status_code=None,
+                    latency_seconds=time.perf_counter() - detail_started,
+                    retry_count=0,
+                    success=False,
+                    error_message=str(exc),
+                )
+                print(f"[detail-stop] job_id={job_id} status=blocked error={exc}")
                 return
             except (DetailPageMismatchError, DetailPageExpiredError) as exc:
+                status = "wrong_page" if isinstance(exc, DetailPageMismatchError) else "expired"
+                database.update_detail_status(job_id, status=status, error_message=str(exc))
                 database.log_crawl(
                     url=detail_url,
                     keyword=keyword,
@@ -248,9 +275,10 @@ async def run_detail_mode(args: argparse.Namespace, database: Database) -> None:
                     success=False,
                     error_message=str(exc),
                 )
-                database.delete_job(job_id)
-                print(f"[detail-skip] job_id={job_id} error={exc}")
+                database.delete_raw_job(job_id)
+                print(f"[detail-skip] job_id={job_id} status={status} error={exc}")
             except Exception as exc:
+                database.update_detail_status(job_id, status="parse_failed", error_message=str(exc))
                 database.log_crawl(
                     url=detail_url,
                     keyword=keyword,
@@ -262,7 +290,7 @@ async def run_detail_mode(args: argparse.Namespace, database: Database) -> None:
                     success=False,
                     error_message=str(exc),
                 )
-                print(f"[detail-failed] job_id={job_id} error={exc}")
+                print(f"[detail-failed] job_id={job_id} status=parse_failed error={exc}")
 
             processed += 1
             if processed == len(pending_jobs):

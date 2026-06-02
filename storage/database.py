@@ -27,11 +27,20 @@ def _table_info(conn: sqlite3.Connection, table_name: str) -> dict[str, sqlite3.
 
 def _needs_jobs_rebuild(columns: dict[str, sqlite3.Row]) -> bool:
     clean_status = columns.get("clean_status")
+    detail_status = columns.get("detail_status")
+    detail_error_message = columns.get("detail_error_message")
+    detail_last_attempt_at = columns.get("detail_last_attempt_at")
     if not clean_status:
         return False
     column_type = (clean_status[2] or "").upper()
     default_value = (clean_status[4] or "").strip("'\"")
-    return column_type != "INTEGER" or default_value != "0"
+    return (
+        column_type != "INTEGER"
+        or default_value != "0"
+        or detail_status is None
+        or detail_error_message is None
+        or detail_last_attempt_at is None
+    )
 
 
 def _rebuild_jobs_table(conn: sqlite3.Connection) -> None:
@@ -61,6 +70,9 @@ def _rebuild_jobs_table(conn: sqlite3.Connection) -> None:
             benefits_json TEXT,
             raw_html TEXT,
             raw_json TEXT,
+            detail_status TEXT NOT NULL DEFAULT 'pending',
+            detail_error_message TEXT,
+            detail_last_attempt_at TEXT,
             clean_status INTEGER NOT NULL DEFAULT 0,
             ai_scored INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
@@ -75,6 +87,7 @@ def _rebuild_jobs_table(conn: sqlite3.Connection) -> None:
             city, exp_years, education, date_posted, last_updated, days_since_update,
             company_name, company_size, company_verified, company_logo_exists,
             publisher_type, jd_text, jd_length, benefits_json, raw_html, raw_json,
+            detail_status, detail_error_message, detail_last_attempt_at,
             clean_status, ai_scored, created_at, updated_at
         )
         SELECT
@@ -82,6 +95,9 @@ def _rebuild_jobs_table(conn: sqlite3.Connection) -> None:
             city, exp_years, education, date_posted, last_updated, days_since_update,
             company_name, company_size, company_verified, company_logo_exists,
             publisher_type, jd_text, jd_length, benefits_json, raw_html, raw_json,
+            COALESCE(detail_status, CASE WHEN title IS NOT NULL AND TRIM(title) <> '' THEN 'success' ELSE 'pending' END),
+            detail_error_message,
+            detail_last_attempt_at,
             {_normalize_flag_value_sql('clean_status', ('1', 'success', 'cleaned', 'done', 'true', 'yes'))},
             {_normalize_flag_value_sql('ai_scored', ('1', 'success', 'scored', 'done', 'true', 'yes'))},
             created_at, updated_at
@@ -240,6 +256,9 @@ class Database:
                     benefits_json TEXT,
                     raw_html TEXT,
                     raw_json TEXT,
+                    detail_status TEXT NOT NULL DEFAULT 'pending',
+                    detail_error_message TEXT,
+                    detail_last_attempt_at TEXT,
                     clean_status INTEGER NOT NULL DEFAULT 0,
                     ai_scored INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
@@ -310,10 +329,28 @@ class Database:
                 """
             )
             job_columns = _table_info(conn, "jobs")
+            if "detail_status" not in job_columns:
+                conn.execute(
+                    "ALTER TABLE jobs ADD COLUMN detail_status TEXT NOT NULL DEFAULT 'pending'"
+                )
+            if "detail_error_message" not in job_columns:
+                conn.execute("ALTER TABLE jobs ADD COLUMN detail_error_message TEXT")
+            if "detail_last_attempt_at" not in job_columns:
+                conn.execute("ALTER TABLE jobs ADD COLUMN detail_last_attempt_at TEXT")
             if "clean_status" not in job_columns:
                 conn.execute(
                     "ALTER TABLE jobs ADD COLUMN clean_status INTEGER NOT NULL DEFAULT 0"
                 )
+            conn.execute(
+                """
+                UPDATE jobs
+                SET detail_status = CASE
+                    WHEN title IS NOT NULL AND TRIM(title) <> '' THEN 'success'
+                    WHEN detail_status IS NULL OR TRIM(detail_status) = '' THEN 'pending'
+                    ELSE detail_status
+                END
+                """
+            )
             conn.execute(
                 f"""
                 UPDATE jobs
@@ -400,11 +437,24 @@ class Database:
                 """
                 INSERT INTO jobs (
                     job_id, keyword, detail_url, title, benefits_json, raw_json,
+                    detail_status, detail_error_message, detail_last_attempt_at,
                     clean_status, created_at, updated_at
-                ) VALUES (?, ?, ?, NULL, '[]', '{}', 0, ?, ?)
+                ) VALUES (?, ?, ?, NULL, '[]', '{}', 'pending', NULL, NULL, 0, ?, ?)
                 ON CONFLICT(job_id) DO UPDATE SET
                     keyword = excluded.keyword,
                     detail_url = excluded.detail_url,
+                    detail_status = CASE
+                        WHEN jobs.title IS NOT NULL AND TRIM(jobs.title) <> '' THEN jobs.detail_status
+                        ELSE 'pending'
+                    END,
+                    detail_error_message = CASE
+                        WHEN jobs.title IS NOT NULL AND TRIM(jobs.title) <> '' THEN jobs.detail_error_message
+                        ELSE NULL
+                    END,
+                    detail_last_attempt_at = CASE
+                        WHEN jobs.title IS NOT NULL AND TRIM(jobs.title) <> '' THEN jobs.detail_last_attempt_at
+                        ELSE NULL
+                    END,
                     clean_status = 0,
                     updated_at = excluded.updated_at
                 """,
@@ -416,7 +466,7 @@ class Database:
         sql = """
             SELECT job_id, keyword, detail_url
             FROM jobs
-            WHERE title IS NULL OR TRIM(title) = ''
+            WHERE detail_status = 'pending'
         """
         params: list[Any] = []
 
@@ -435,7 +485,7 @@ class Database:
         sql = """
             SELECT COUNT(*)
             FROM jobs
-            WHERE title IS NULL OR TRIM(title) = ''
+            WHERE detail_status = 'pending'
         """
         params: list[Any] = []
 
@@ -686,6 +736,9 @@ class Database:
             "benefits_json": json.dumps(benefits or [], ensure_ascii=False),
             "raw_html": job.get("raw_html"),
             "raw_json": json.dumps(job, ensure_ascii=False),
+            "detail_status": "success",
+            "detail_error_message": None,
+            "detail_last_attempt_at": now,
             "clean_status": 0,
             "created_at": now,
             "updated_at": now,
@@ -699,14 +752,16 @@ class Database:
                     salary_months, city, exp_years, education, date_posted,
                     last_updated, days_since_update, company_name, company_size,
                     company_verified, company_logo_exists, publisher_type,
-                    jd_text, jd_length, benefits_json, raw_html, raw_json, clean_status,
+                    jd_text, jd_length, benefits_json, raw_html, raw_json,
+                    detail_status, detail_error_message, detail_last_attempt_at, clean_status,
                     created_at, updated_at
                 ) VALUES (
                     :job_id, :keyword, :detail_url, :title, :salary_min, :salary_max,
                     :salary_months, :city, :exp_years, :education, :date_posted,
                     :last_updated, :days_since_update, :company_name, :company_size,
                     :company_verified, :company_logo_exists, :publisher_type,
-                    :jd_text, :jd_length, :benefits_json, :raw_html, :raw_json, :clean_status,
+                    :jd_text, :jd_length, :benefits_json, :raw_html, :raw_json,
+                    :detail_status, :detail_error_message, :detail_last_attempt_at, :clean_status,
                     :created_at, :updated_at
                 )
                 ON CONFLICT(job_id) DO UPDATE SET
@@ -732,6 +787,9 @@ class Database:
                     benefits_json = excluded.benefits_json,
                     raw_html = excluded.raw_html,
                     raw_json = excluded.raw_json,
+                    detail_status = excluded.detail_status,
+                    detail_error_message = excluded.detail_error_message,
+                    detail_last_attempt_at = excluded.detail_last_attempt_at,
                     clean_status = excluded.clean_status,
                     updated_at = excluded.updated_at
                 """
@@ -865,6 +923,28 @@ class Database:
             )
             conn.commit()
 
+    def update_detail_status(
+        self,
+        job_id: str,
+        *,
+        status: str,
+        error_message: Optional[str] = None,
+    ) -> None:
+        now = datetime.utcnow().isoformat(timespec="seconds")
+        with closing(self.connect()) as conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET detail_status = ?,
+                    detail_error_message = ?,
+                    detail_last_attempt_at = ?,
+                    updated_at = ?
+                WHERE job_id = ?
+                """,
+                (status, error_message, now, now, job_id),
+            )
+            conn.commit()
+
     def delete_job(self, job_id: str) -> None:
         with closing(self.connect()) as conn:
             conn.execute(
@@ -881,6 +961,17 @@ class Database:
                 """,
                 (job_id,),
             )
+            conn.execute(
+                """
+                DELETE FROM jobs
+                WHERE job_id = ?
+                """,
+                (job_id,),
+            )
+            conn.commit()
+
+    def delete_raw_job(self, job_id: str) -> None:
+        with closing(self.connect()) as conn:
             conn.execute(
                 """
                 DELETE FROM jobs
