@@ -1,0 +1,22 @@
+{
+  "generated_at": "2026-06-05T08:11:47",
+  "cookie_file": "cookie_20260605_161126_15317685379_liepin.json",
+  "origin": "https://c.liepin.com",
+  "referer": "https://c.liepin.com/",
+  "accept": "application/json, text/plain, */*",
+  "accept_language": "zh-CN",
+  "content_type": "application/x-www-form-urlencoded",
+  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+  "sec_ch_ua": "\"Chromium\";v=\"125\", \"Not.A/Brand\";v=\"24\"",
+  "sec_ch_ua_mobile": "?0",
+  "sec_ch_ua_platform": "\"Win32\"",
+  "sec_fetch_dest": "empty",
+  "sec_fetch_mode": "cors",
+  "sec_fetch_site": "same-site",
+  "x_client_type": "web",
+  "x_fscp_fe_version": "1.0.0",
+  "x_fscp_std_info": "{\"client_id\":\"11156\"}",
+  "x_fscp_version": "1.1",
+  "x_fscp_trace_id_example": "2ae9f64b-af02-42d8-88a1-5f1d5661b56c",
+  "x_fscp_bi_stat_location": "https://c.liepin.com/?time=1780618307231"
+}

@@ -1,6 +1,6 @@
 import argparse
 
-from config import PATHS
+from config import PATHS, normalize_keyword
 from cleaning.job_cleaner import run_cleaning
 
 
@@ -18,6 +18,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    args.keyword = normalize_keyword(args.keyword)
     result = run_cleaning(
         PATHS["database"],
         keyword=args.keyword,

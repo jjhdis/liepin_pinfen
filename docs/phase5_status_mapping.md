@@ -59,10 +59,8 @@
   - 当前 job 详情抓取成功
 - `detail-stop`
   - `blocked` / `login_required`
-  - 当前批次立即停止
-- `detail-skip`
   - `expired` / `wrong_page`
-  - 当前 job 丢弃，批次继续
+  - 当前批次立即停止
 - `detail-failed`
   - `parse_failed` 或其他未分类异常
 
@@ -80,10 +78,10 @@
   - 终端日志：`detail-stop`
 - `DetailPageExpiredError`
   - `detail_status = 'expired'`
-  - 终端日志：`detail-skip`
+  - 终端日志：`detail-stop`
 - `DetailPageMismatchError`
   - `detail_status = 'wrong_page'`
-  - 终端日志：`detail-skip`
+  - 终端日志：`detail-stop`
 - 其他异常
   - `detail_status = 'parse_failed'`
   - 终端日志：`detail-failed`
@@ -136,6 +134,6 @@
 2. stub 默认状态为 `pending`
 3. `detail` 只抓 `pending`
 4. 抓成功写 `success`
-5. `expired / wrong_page` 直接剔除当前原始 job
+5. `expired / wrong_page` 直接剔除当前原始 job，并立即停当前批次
 6. `blocked / login_required` 立即停当前批次
 7. `parse_failed` 保留失败状态，后续人工分析

@@ -65,35 +65,41 @@ def _extract_job_cards_from_html(html: str) -> list[dict[str, str]]:
     job_cards: list[dict[str, str]] = []
     seen_job_ids: set[str] = set()
 
-    for anchor in soup.select('a[data-nick="job-detail-job-info"]'):
+    for card in soup.select("div.job-card-pc-container"):
+        style = " ".join(str(card.get("style") or "").lower().split())
+        if "display:none" in style or 'display: none' in style:
+            continue
+
+        anchor = card.select_one('a[data-nick="job-detail-job-info"]')
+        if not anchor:
+            continue
+
         href = (anchor.get("href") or "").strip()
         if not href:
             continue
 
-        container = anchor
-        while container and container.name:
-            ext = container.attrs.get("data-tlg-ext")
-            if ext:
-                decoded = unquote(ext)
-                match = re.search(r'"jobId"\s*:\s*"(\d+)"', decoded)
-                if match:
-                    job_id = match.group(1)
-                    if job_id not in seen_job_ids:
-                        seen_job_ids.add(job_id)
-                        job_cards.append({"job_id": job_id, "detail_url": href})
-                    break
+        ext = card.attrs.get("data-tlg-ext")
+        if not ext:
+            continue
 
-                try:
-                    payload = json.loads(decoded)
-                except json.JSONDecodeError:
-                    payload = None
-                if isinstance(payload, dict):
-                    job_id = str(payload.get("jobId") or "").strip()
-                    if job_id and job_id not in seen_job_ids:
-                        seen_job_ids.add(job_id)
-                        job_cards.append({"job_id": job_id, "detail_url": href})
-                    break
-            container = container.parent
+        decoded = unquote(ext)
+        match = re.search(r'"jobId"\s*:\s*"(\d+)"', decoded)
+        if match:
+            job_id = match.group(1)
+            if job_id not in seen_job_ids:
+                seen_job_ids.add(job_id)
+                job_cards.append({"job_id": job_id, "detail_url": href})
+            continue
+
+        try:
+            payload = json.loads(decoded)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            job_id = str(payload.get("jobId") or "").strip()
+            if job_id and job_id not in seen_job_ids:
+                seen_job_ids.add(job_id)
+                job_cards.append({"job_id": job_id, "detail_url": href})
 
     return job_cards
 

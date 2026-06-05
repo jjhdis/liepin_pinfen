@@ -2,9 +2,11 @@ import argparse
 import asyncio
 import time
 
-from config import PATHS, RUN_CONFIG
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+from config import PATHS, RUN_CONFIG, normalize_keyword
 from crawler.anti_detect import human_like_page_settle, random_delay
-from crawler.browser import open_browser
+from crawler.browser import open_browser, resolve_cookie_path
 from crawler.detail_page import (
     DetailPageBlockedError,
     DetailPageExpiredError,
@@ -30,6 +32,16 @@ def _add_interactive_arg(parser: argparse.ArgumentParser, default: bool) -> None
     )
 
 
+def _add_cookie_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--cookie-file",
+        help=(
+            "Cookie file to use for Liepin. Supports an absolute path, a project-relative "
+            "path, or a filename under the cookies/ directory. Default: cookies.json"
+        ),
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Low-frequency liepin crawler with split list/detail modes."
@@ -42,7 +54,14 @@ def parse_args() -> argparse.Namespace:
     list_parser.add_argument("--pages", type=int, default=RUN_CONFIG["list"]["pages"], help="How many pages to fetch.")
     list_parser.add_argument("--min-delay", type=float, default=RUN_CONFIG["list"]["min_delay"])
     list_parser.add_argument("--max-delay", type=float, default=RUN_CONFIG["list"]["max_delay"])
+    list_parser.add_argument(
+        "--store-top-n",
+        type=int,
+        default=RUN_CONFIG["list"]["store_top_n"],
+        help="Only keep the first N list cards from each search page. Default: %(default)s",
+    )
     _add_interactive_arg(list_parser, RUN_CONFIG["list"]["interactive"])
+    _add_cookie_arg(list_parser)
 
     detail_parser = subparsers.add_parser("detail", help="Fetch a small batch of pending detail pages.")
     detail_parser.add_argument("--keyword", help="Optional keyword filter.")
@@ -50,6 +69,8 @@ def parse_args() -> argparse.Namespace:
     detail_parser.add_argument("--min-delay", type=float, default=RUN_CONFIG["detail"]["min_delay"])
     detail_parser.add_argument("--max-delay", type=float, default=RUN_CONFIG["detail"]["max_delay"])
     _add_interactive_arg(detail_parser, RUN_CONFIG["detail"]["interactive"])
+    _add_cookie_arg(detail_parser)
+    detail_parser.add_argument("--cookie-profile-name", help="Cookie profile name for crawl_log tracing.")
     detail_parser.add_argument("--startup-cooldown-min", type=float, default=RUN_CONFIG["detail"]["startup_cooldown_min"])
     detail_parser.add_argument("--startup-cooldown-max", type=float, default=RUN_CONFIG["detail"]["startup_cooldown_max"])
     detail_parser.add_argument("--confirm-every", type=int, default=RUN_CONFIG["detail"]["confirm_every"])
@@ -66,7 +87,13 @@ def _confirm(prompt: str) -> bool:
 
 
 async def run_list_mode(args: argparse.Namespace, database: Database) -> None:
-    async with open_browser() as (_, context):
+    cookie_path = resolve_cookie_path(args.cookie_file)
+    if args.cookie_file and not cookie_path.exists():
+        raise FileNotFoundError(f"Cookie file not found: {cookie_path}")
+
+    print(f"[cookie-selected] file={cookie_path}")
+
+    async with open_browser(args.cookie_file) as (_, context):
         page = await context.new_page()
 
         if args.interactive and not _confirm(
@@ -145,7 +172,10 @@ async def run_list_mode(args: argparse.Namespace, database: Database) -> None:
                 )
                 return
 
-            for item in job_cards:
+            selected_job_cards = job_cards[: args.store_top_n] if args.store_top_n > 0 else job_cards
+            dropped_count = max(0, len(job_cards) - len(selected_job_cards))
+
+            for item in selected_job_cards:
                 database.insert_job_stub(
                     job_id=item["job_id"],
                     keyword=args.keyword,
@@ -154,6 +184,7 @@ async def run_list_mode(args: argparse.Namespace, database: Database) -> None:
 
             print(
                 f"[list-success] keyword={args.keyword} page={page_no} "
+                f"stored={len(selected_job_cards)} dropped_tail={dropped_count} "
                 f"pending_total={database.pending_job_count(keyword=args.keyword)} action=stored"
             )
 
@@ -167,6 +198,10 @@ async def run_list_mode(args: argparse.Namespace, database: Database) -> None:
 
 
 async def run_detail_mode(args: argparse.Namespace, database: Database) -> None:
+    cookie_path = resolve_cookie_path(args.cookie_file)
+    if args.cookie_file and not cookie_path.exists():
+        raise FileNotFoundError(f"Cookie file not found: {cookie_path}")
+
     pending_jobs = database.get_pending_jobs(keyword=args.keyword, limit=args.max_detail)
     if not pending_jobs:
         print("[detail] no pending jobs found")
@@ -174,7 +209,8 @@ async def run_detail_mode(args: argparse.Namespace, database: Database) -> None:
 
     print(
         f"[detail-plan] keyword={args.keyword or 'ALL'} "
-        f"batch={len(pending_jobs)} pending_total={database.pending_job_count(keyword=args.keyword)}"
+        f"batch={len(pending_jobs)} pending_total={database.pending_job_count(keyword=args.keyword)} "
+        f"cookie={cookie_path.name}"
     )
 
     if args.interactive and not _confirm("Start fetching the pending detail batch?"):
@@ -187,7 +223,9 @@ async def run_detail_mode(args: argparse.Namespace, database: Database) -> None:
     )
     print(f"[detail-startup-cooldown] sleep_seconds={startup_cooldown_seconds:.1f}")
 
-    async with open_browser() as (_, context):
+    print(f"[cookie-selected] file={cookie_path}")
+
+    async with open_browser(args.cookie_file) as (_, context):
         page = await context.new_page()
         processed = 0
 
@@ -225,6 +263,7 @@ async def run_detail_mode(args: argparse.Namespace, database: Database) -> None:
                     retry_count=0,
                     success=True,
                     error_message=None,
+                    cookie_profile_name=args.cookie_profile_name,
                 )
                 print(
                     f"[detail-success] job_id={job_id} title={job.get('title')} "
@@ -243,6 +282,7 @@ async def run_detail_mode(args: argparse.Namespace, database: Database) -> None:
                     retry_count=0,
                     success=False,
                     error_message=str(exc),
+                    cookie_profile_name=args.cookie_profile_name,
                 )
                 print(f"[detail-stop] job_id={job_id} status={status} error={exc}")
                 return
@@ -258,6 +298,7 @@ async def run_detail_mode(args: argparse.Namespace, database: Database) -> None:
                     retry_count=0,
                     success=False,
                     error_message=str(exc),
+                    cookie_profile_name=args.cookie_profile_name,
                 )
                 print(f"[detail-stop] job_id={job_id} status=blocked error={exc}")
                 return
@@ -274,9 +315,33 @@ async def run_detail_mode(args: argparse.Namespace, database: Database) -> None:
                     retry_count=0,
                     success=False,
                     error_message=str(exc),
+                    cookie_profile_name=args.cookie_profile_name,
                 )
                 database.delete_raw_job(job_id)
-                print(f"[detail-skip] job_id={job_id} status={status} error={exc}")
+                print(
+                    f"[detail-stop] job_id={job_id} status={status} "
+                    f"action=delete_and_stop error={exc}"
+                )
+                return
+            except PlaywrightTimeoutError as exc:
+                database.update_detail_status(job_id, status="parse_failed", error_message=str(exc))
+                database.log_crawl(
+                    url=detail_url,
+                    keyword=keyword,
+                    page_no=None,
+                    job_id=job_id,
+                    status_code=None,
+                    latency_seconds=time.perf_counter() - detail_started,
+                    retry_count=0,
+                    success=False,
+                    error_message=str(exc),
+                    cookie_profile_name=args.cookie_profile_name,
+                )
+                database.delete_raw_job(job_id)
+                print(
+                    f"[detail-skip] job_id={job_id} status=timeout "
+                    f"action=delete_and_continue error={exc}"
+                )
             except Exception as exc:
                 database.update_detail_status(job_id, status="parse_failed", error_message=str(exc))
                 database.log_crawl(
@@ -289,6 +354,7 @@ async def run_detail_mode(args: argparse.Namespace, database: Database) -> None:
                     retry_count=0,
                     success=False,
                     error_message=str(exc),
+                    cookie_profile_name=args.cookie_profile_name,
                 )
                 print(f"[detail-failed] job_id={job_id} status=parse_failed error={exc}")
 
@@ -324,6 +390,8 @@ async def async_main(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
+    if hasattr(args, "keyword"):
+        args.keyword = normalize_keyword(args.keyword)
     asyncio.run(async_main(args))
 
 

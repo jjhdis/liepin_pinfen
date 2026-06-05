@@ -1,5 +1,7 @@
 import os
 from pathlib import Path
+from typing import Optional
+from urllib.parse import unquote
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -8,9 +10,9 @@ SEARCH_CONFIG = {
     "city_code": "020",
     "dq_code": "020",
     "keywords": [
-        "%E5%85%A8%E6%A0%88",
+        "全栈",
         "python",
-        "c%23",
+        "c#",
         "java",
     ],
     "pages_per_keyword": 5,
@@ -34,10 +36,22 @@ SEARCH_CONFIG = {
 # 运行默认参数。
 # 命令行如果不显式传参，就会使用这里的值。
 RUN_CONFIG = {
+    # 是否在 cookie 轮换时自动触发后处理 pipeline。
+    # True: 每份 cookie 跑完后检查待清洗数量，达到阈值时自动执行 clean→enrich→score
+    # False: 所有后处理阶段手动执行
+    "auto_postprocess": False,
+    # 触发自动后处理的最小待清洗职位数
+    "auto_postprocess_min_jobs": 50,
+    # Cookie 文件最大保留天数，超过自动删除
+    "cookie_max_age_days": 2,
+    # 单次 rotate 最多使用几份 cookie，None 或 0 = 不限制
+    "cookie_max_per_run": 3,
     "list": {
         # 列表页默认从第几页开始抓，以及连续抓多少页。
         "page": 0,
         "pages": 1,
+        # 每个列表页默认只保留前多少条职位进入待抓详情队列。
+        "store_top_n": 30,
         # 列表页之间的等待时间，单位秒。
         "min_delay": 60.0,
         "max_delay": 120.0,
@@ -46,7 +60,7 @@ RUN_CONFIG = {
     },
     "detail": {
         # 单次 detail 命令默认最多处理多少条 pending 职位。
-        "max_detail": 10,
+        "max_detail": 25,
         # 相邻两个详情页之间的常规等待时间，单位秒。
         "min_delay": 45.0,
         "max_delay": 90.0,
@@ -75,6 +89,7 @@ BROWSER_CONFIG = {
 
 PATHS = {
     "cookies": BASE_DIR / "cookies.json",
+    "cookie_dir": BASE_DIR / "cookies",
     "zhihu_cookies": BASE_DIR / "zhihu_cookies.json",
     "database": BASE_DIR / "jobs.db",
     "debug": BASE_DIR / "debug",
@@ -116,6 +131,33 @@ ZHIHU_CONFIG = {
     "source": "zhihu_search_v1",
 }
 
+LIEPIN_MESSAGE_CONFIG = {
+    "contact_list_api": "https://api-c.liepin.com/api/com.liepin.im.c.contact.get-contact-list",
+    "origin": "https://c.liepin.com",
+    "referer": "https://c.liepin.com/",
+    "user_agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0"
+    ),
+    "accept": "application/json, text/plain, */*",
+    "accept_language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+    "content_type": "application/x-www-form-urlencoded",
+    "sec_ch_ua": '"Chromium";v="148", "Microsoft Edge";v="148", "Not/A)Brand";v="99"',
+    "sec_ch_ua_mobile": "?0",
+    "sec_ch_ua_platform": '"Windows"',
+    "sec_fetch_dest": "empty",
+    "sec_fetch_mode": "cors",
+    "sec_fetch_site": "same-site",
+    "x_client_type": "web",
+    "x_fscp_fe_version": "1.0.0",
+    "x_fscp_std_info": '{"client_id":"11156"}',
+    "x_fscp_version": "1.1",
+    "page_size": 50,
+    "max_pages": 20,
+    "request_timeout_seconds": 30.0,
+}
+
 AI_CONFIG = {
     "api_key": os.getenv("DEEPSEEK_API_KEY", "sk-48560546f57b4262bdaeca0353c58bf5"),
     "base_url": os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
@@ -129,3 +171,18 @@ AI_CONFIG = {
 
 SCORE_THRESHOLD = 60
 TOP_N_JOBS = 30
+
+
+def normalize_keyword(keyword: Optional[str]) -> Optional[str]:
+    if keyword is None:
+        return None
+
+    normalized = unquote(str(keyword).strip())
+    if not normalized:
+        return None
+
+    alias_map = {
+        "csharp": "c#",
+        "全棧": "全栈",
+    }
+    return alias_map.get(normalized.lower(), normalized)

@@ -279,6 +279,7 @@ class Database:
                     retry_count INTEGER NOT NULL DEFAULT 0,
                     success INTEGER NOT NULL,
                     error_message TEXT,
+                    cookie_profile_name TEXT,
                     created_at TEXT NOT NULL
                 )
                 """
@@ -325,6 +326,83 @@ class Database:
                     expire_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS account_message_status (
+                    platform TEXT NOT NULL,
+                    cookie_profile_id TEXT NOT NULL,
+                    account_label TEXT,
+                    cookie_file TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    has_unread INTEGER NOT NULL DEFAULT 0,
+                    unread_total INTEGER NOT NULL DEFAULT 0,
+                    contact_total INTEGER NOT NULL DEFAULT 0,
+                    latest_contact_name TEXT,
+                    latest_contact_company TEXT,
+                    latest_msg_time TEXT,
+                    checked_at TEXT,
+                    error_message TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (platform, cookie_profile_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS message_contacts (
+                    platform TEXT NOT NULL,
+                    cookie_profile_id TEXT NOT NULL,
+                    account_label TEXT,
+                    cookie_file TEXT,
+                    contact_id TEXT NOT NULL,
+                    name TEXT,
+                    company TEXT,
+                    user_tag TEXT,
+                    title TEXT,
+                    photo TEXT,
+                    home_page TEXT,
+                    latest_msg_id TEXT,
+                    latest_msg_type TEXT,
+                    last_payload_json TEXT,
+                    last_message_preview TEXT,
+                    unread_cnt INTEGER NOT NULL DEFAULT 0,
+                    latest_msg_time TEXT,
+                    user_id TEXT,
+                    im_user_type TEXT,
+                    opposite_user_id TEXT,
+                    im_id TEXT,
+                    opposite_im_id TEXT,
+                    opposite_im_user_type TEXT,
+                    chat_type TEXT,
+                    direction TEXT,
+                    contact INTEGER NOT NULL DEFAULT 1,
+                    checked_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (platform, cookie_profile_id, contact_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cookie_profiles (
+                    platform TEXT NOT NULL,
+                    profile_name TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'ready',
+                    last_used_at TEXT,
+                    detail_count_today INTEGER NOT NULL DEFAULT 0,
+                    detail_total_count INTEGER NOT NULL DEFAULT 0,
+                    cooldown_until TEXT,
+                    last_error TEXT,
+                    last_error_at TEXT,
+                    notes TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (platform, profile_name)
                 )
                 """
             )
@@ -413,6 +491,14 @@ class Database:
                 conn.execute(
                     "ALTER TABLE company_enriched ADD COLUMN zhihu_filtered_results_json TEXT NOT NULL DEFAULT '[]'"
                 )
+
+            crawl_log_columns = _table_info(conn, "crawl_log")
+            if "cookie_profile_name" not in crawl_log_columns:
+                if "cookie_profile_id" in crawl_log_columns:
+                    conn.execute("ALTER TABLE crawl_log RENAME COLUMN cookie_profile_id TO cookie_profile_name")
+                else:
+                    conn.execute("ALTER TABLE crawl_log ADD COLUMN cookie_profile_name TEXT")
+
             conn.commit()
 
     def job_exists(self, job_id: str) -> bool:
@@ -496,6 +582,22 @@ class Database:
         with closing(self.connect()) as conn:
             return int(conn.execute(sql, params).fetchone()[0])
 
+    def ready_for_clean_count(self, *, keyword: Optional[str] = None) -> int:
+        """Count detail-scraped jobs that haven't been cleaned yet."""
+        sql = """
+            SELECT COUNT(*)
+            FROM jobs
+            WHERE detail_status = 'success'
+              AND clean_status = 0
+        """
+        params: list[Any] = []
+        if keyword:
+            sql += " AND keyword = ?"
+            params.append(keyword)
+
+        with closing(self.connect()) as conn:
+            return int(conn.execute(sql, params).fetchone()[0])
+
     def get_jobs_ready_for_scoring(
         self,
         *,
@@ -525,6 +627,10 @@ class Database:
               AND (
                   c.score_status IS NULL
                   OR c.score_status <> 1
+              )
+              AND (
+                  COALESCE(c.need_company_check, 0) = 0
+                  OR COALESCE(c.company_check_status, 'skip') != 'pending'
               )
         """
         params: list[Any] = []
@@ -564,6 +670,10 @@ class Database:
               AND (
                   c.score_status IS NULL
                   OR c.score_status <> 1
+              )
+              AND (
+                  COALESCE(c.need_company_check, 0) = 0
+                  OR COALESCE(c.company_check_status, 'skip') != 'pending'
               )
         """
         params: list[Any] = []
@@ -810,14 +920,15 @@ class Database:
         retry_count: int,
         success: bool,
         error_message: Optional[str] = None,
+        cookie_profile_name: Optional[str] = None,
     ) -> None:
         with closing(self.connect()) as conn:
             conn.execute(
                 """
                 INSERT INTO crawl_log (
                     url, keyword, page_no, job_id, status_code, latency_seconds,
-                    retry_count, success, error_message, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    retry_count, success, error_message, cookie_profile_name, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     url,
@@ -829,6 +940,7 @@ class Database:
                     retry_count,
                     int(success),
                     error_message,
+                    cookie_profile_name,
                     datetime.utcnow().isoformat(timespec="seconds"),
                 ),
             )
@@ -980,3 +1092,228 @@ class Database:
                 (job_id,),
             )
             conn.commit()
+
+    def upsert_account_message_status(self, payload: dict[str, Any]) -> None:
+        now = datetime.utcnow().isoformat(timespec="seconds")
+        record = {
+            "platform": payload["platform"],
+            "cookie_profile_id": payload["cookie_profile_id"],
+            "account_label": payload.get("account_label"),
+            "cookie_file": payload.get("cookie_file"),
+            "status": payload.get("status", "success"),
+            "has_unread": int(bool(payload.get("has_unread"))),
+            "unread_total": int(payload.get("unread_total") or 0),
+            "contact_total": int(payload.get("contact_total") or 0),
+            "latest_contact_name": payload.get("latest_contact_name"),
+            "latest_contact_company": payload.get("latest_contact_company"),
+            "latest_msg_time": payload.get("latest_msg_time"),
+            "checked_at": payload.get("checked_at", now),
+            "error_message": payload.get("error_message"),
+            "created_at": now,
+            "updated_at": now,
+        }
+
+        with closing(self.connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO account_message_status (
+                    platform, cookie_profile_id, account_label, cookie_file,
+                    status, has_unread, unread_total, contact_total,
+                    latest_contact_name, latest_contact_company, latest_msg_time,
+                    checked_at, error_message, created_at, updated_at
+                ) VALUES (
+                    :platform, :cookie_profile_id, :account_label, :cookie_file,
+                    :status, :has_unread, :unread_total, :contact_total,
+                    :latest_contact_name, :latest_contact_company, :latest_msg_time,
+                    :checked_at, :error_message, :created_at, :updated_at
+                )
+                ON CONFLICT(platform, cookie_profile_id) DO UPDATE SET
+                    account_label = excluded.account_label,
+                    cookie_file = excluded.cookie_file,
+                    status = excluded.status,
+                    has_unread = excluded.has_unread,
+                    unread_total = excluded.unread_total,
+                    contact_total = excluded.contact_total,
+                    latest_contact_name = excluded.latest_contact_name,
+                    latest_contact_company = excluded.latest_contact_company,
+                    latest_msg_time = excluded.latest_msg_time,
+                    checked_at = excluded.checked_at,
+                    error_message = excluded.error_message,
+                    updated_at = excluded.updated_at
+                """,
+                record,
+            )
+            conn.commit()
+
+    def replace_message_contacts(
+        self,
+        *,
+        platform: str,
+        cookie_profile_id: str,
+        account_label: Optional[str],
+        cookie_file: Optional[str],
+        contacts: list[dict[str, Any]],
+        checked_at: str,
+    ) -> None:
+        now = datetime.utcnow().isoformat(timespec="seconds")
+        with closing(self.connect()) as conn:
+            conn.execute(
+                """
+                DELETE FROM message_contacts
+                WHERE platform = ?
+                  AND cookie_profile_id = ?
+                """,
+                (platform, cookie_profile_id),
+            )
+
+            for item in contacts:
+                conn.execute(
+                    """
+                    INSERT INTO message_contacts (
+                        platform, cookie_profile_id, account_label, cookie_file,
+                        contact_id, name, company, user_tag, title, photo, home_page,
+                        latest_msg_id, latest_msg_type, last_payload_json, last_message_preview,
+                        unread_cnt, latest_msg_time, user_id, im_user_type, opposite_user_id,
+                        im_id, opposite_im_id, opposite_im_user_type, chat_type, direction,
+                        contact, checked_at, created_at, updated_at
+                    ) VALUES (
+                        ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?
+                    )
+                    """,
+                    (
+                        platform,
+                        cookie_profile_id,
+                        account_label,
+                        cookie_file,
+                        item.get("contact_id"),
+                        item.get("name"),
+                        item.get("company"),
+                        item.get("user_tag"),
+                        item.get("title"),
+                        item.get("photo"),
+                        item.get("home_page"),
+                        item.get("latest_msg_id"),
+                        item.get("latest_msg_type"),
+                        item.get("last_payload_json"),
+                        item.get("last_message_preview"),
+                        int(item.get("unread_cnt") or 0),
+                        item.get("latest_msg_time"),
+                        item.get("user_id"),
+                        item.get("im_user_type"),
+                        item.get("opposite_user_id"),
+                        item.get("im_id"),
+                        item.get("opposite_im_id"),
+                        item.get("opposite_im_user_type"),
+                        item.get("chat_type"),
+                        item.get("direction"),
+                        int(bool(item.get("contact"))),
+                        checked_at,
+                        now,
+                        now,
+                    ),
+                )
+            conn.commit()
+
+    # ------------------------------------------------------------------
+    # cookie_profiles
+    # ------------------------------------------------------------------
+
+    def upsert_cookie_profile(
+        self,
+        *,
+        platform: str,
+        profile_name: str,
+        status: str = "ready",
+        notes: str = "",
+        updated_at: str,
+        reset_counters: bool = False,
+    ) -> None:
+        now = datetime.utcnow().isoformat(timespec="seconds")
+        counter_sql = (
+            ", detail_count_today = 0, detail_total_count = 0"
+            if reset_counters
+            else ""
+        )
+        with closing(self.connect()) as conn:
+            conn.execute(
+                f"""
+                INSERT INTO cookie_profiles (
+                    platform, profile_name, status, notes, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(platform, profile_name) DO UPDATE SET
+                    status = excluded.status,
+                    notes = excluded.notes,
+                    updated_at = excluded.updated_at
+                    {counter_sql}
+                """,
+                (platform, profile_name, status, notes, now, updated_at),
+            )
+            conn.commit()
+
+    def increment_cookie_usage(
+        self,
+        platform: str,
+        profile_name: str,
+    ) -> None:
+        now = datetime.utcnow().isoformat(timespec="seconds")
+        with closing(self.connect()) as conn:
+            conn.execute(
+                """
+                UPDATE cookie_profiles
+                SET last_used_at = ?,
+                    detail_count_today = CASE
+                        WHEN DATE(last_used_at) < DATE(?) THEN 1
+                        ELSE detail_count_today + 1
+                    END,
+                    detail_total_count = detail_total_count + 1,
+                    updated_at = ?
+                WHERE platform = ? AND profile_name = ?
+                """,
+                (now, now, now, platform, profile_name),
+            )
+            conn.commit()
+
+    def update_cookie_profile_status(
+        self,
+        platform: str,
+        profile_name: str,
+        *,
+        status: str,
+        last_error: str = "",
+        last_error_at: str = "",
+    ) -> None:
+        now = datetime.utcnow().isoformat(timespec="seconds")
+        with closing(self.connect()) as conn:
+            conn.execute(
+                """
+                UPDATE cookie_profiles
+                SET status = ?,
+                    last_error = ?,
+                    last_error_at = ?,
+                    updated_at = ?
+                WHERE platform = ? AND profile_name = ?
+                """,
+                (status, last_error, last_error_at, now, platform, profile_name),
+            )
+            conn.commit()
+
+    def get_ready_cookie_profiles(
+        self, platform: str
+    ) -> list[dict[str, Any]]:
+        with closing(self.connect()) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM cookie_profiles
+                WHERE platform = ? AND status = 'ready'
+                ORDER BY profile_name
+                """,
+                (platform,),
+            ).fetchall()
+        return [dict(row) for row in rows]

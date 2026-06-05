@@ -1,12 +1,15 @@
 import argparse
 import json
 import sqlite3
+import sys
 from contextlib import closing
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from config import PATHS
+from config import PATHS, RUN_CONFIG
+from cookie_manager import scan_and_cleanup
 
 
 HTML_PAGE = """<!doctype html>
@@ -182,6 +185,7 @@ HTML_PAGE = """<!doctype html>
     <div class="nav">
       <a class="active" href="/">抓取监控</a>
       <a href="/scores">Score 结果</a>
+      <a href="/cookies">Cookie 管理</a>
     </div>
 
     <div class="grid" id="cards"></div>
@@ -542,6 +546,7 @@ SCORES_PAGE = """<!doctype html>
     <div class="nav">
       <a href="/">抓取监控</a>
       <a class="active" href="/scores">Score 结果</a>
+      <a href="/cookies">Cookie 管理</a>
     </div>
 
     <div class="grid" id="cards"></div>
@@ -685,6 +690,298 @@ SCORES_PAGE = """<!doctype html>
     document.getElementById('reload-btn').addEventListener('click', loadScores);
     setInterval(loadScores, 30000);
     loadScores().catch(err => {
+      document.getElementById('meta').textContent = `加载失败: ${err.message}`;
+    });
+  </script>
+</body>
+</html>
+"""
+
+
+COOKIES_PAGE = """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cookie Manager</title>
+  <style>
+    :root {
+      --bg: #f4f0e8; --panel: #fffaf2; --line: #d9cdb8; --text: #1f1a14;
+      --muted: #6e6357; --accent: #165d52; --warn: #9a5b00; --danger: #a13131;
+      --ok: #2f6b2f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: radial-gradient(circle at top left, #efe4d3 0, transparent 28%),
+                  linear-gradient(180deg, #f7f1e7 0%, #f1eadf 100%);
+      color: var(--text);
+    }
+    .wrap { max-width: 1300px; margin: 0 auto; padding: 24px; }
+    .topbar { display: flex; justify-content: space-between; align-items: end; gap: 16px; margin-bottom: 18px; }
+    h1 { margin: 0; font-size: 30px; letter-spacing: .02em; }
+    .sub, .meta { color: var(--muted); font-size: 13px; }
+    .nav { display: flex; gap: 8px; margin: 0 0 16px 0; flex-wrap: wrap; }
+    .nav a {
+      display: inline-flex; align-items: center; padding: 8px 12px;
+      border-radius: 999px; border: 1px solid var(--line); color: var(--text);
+      text-decoration: none; background: rgba(255,250,242,.9); font-size: 13px;
+    }
+    .nav a.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+    .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }
+    .card, .panel {
+      background: rgba(255,250,242,.96); border: 1px solid var(--line);
+      border-radius: 16px; box-shadow: 0 10px 30px rgba(64, 44, 17, 0.07);
+    }
+    .card { padding: 16px; min-height: 100px; }
+    .k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+    .v { font-size: 34px; font-weight: 700; margin-top: 10px; }
+    .note { margin-top: 8px; color: var(--muted); font-size: 12px; }
+    .panel { padding: 14px; overflow: hidden; margin-bottom: 14px; }
+    .panel h2 { margin: 0 0 10px 0; font-size: 16px; }
+
+    .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+    input, select, button {
+      border: 1px solid var(--line); background: #fffdf8; color: var(--text);
+      border-radius: 10px; padding: 8px 10px; font-size: 13px;
+    }
+    button { background: var(--accent); color: #fff; border-color: var(--accent); cursor: pointer; }
+    button.danger { background: var(--danger); border-color: var(--danger); }
+    button.warn { background: var(--warn); border-color: var(--warn); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td {
+      border-top: 1px solid #eadfce; padding: 9px 8px; text-align: left;
+      vertical-align: top; word-break: break-word;
+    }
+    thead th { border-top: none; color: var(--muted); font-size: 12px; font-weight: 600; }
+
+    .chip {
+      display: inline-flex; align-items: center; padding: 2px 9px; border-radius: 999px;
+      font-size: 12px; font-weight: 600; border: 1px solid currentColor; white-space: nowrap;
+    }
+    .chip.ready { color: #245d24; background: #def6de; }
+    .chip.cooldown { color: #7d6200; background: #fff3cc; }
+    .chip.needs_manual_verify { color: #8b2222; background: #f7d8d8; }
+    .chip.disabled { color: #555; background: #eee; }
+    .chip.fresh { color: #245d24; background: #def6de; }
+    .chip.day_old { color: #8b5b10; background: #f8e7c8; }
+    .chip.stale { color: #8b2222; background: #f7d8d8; }
+
+    .mono { font-family: Consolas, "Courier New", monospace; font-size: 12px; }
+    .muted { color: var(--muted); }
+    .empty { color: var(--muted); padding: 12px 2px 2px; }
+    .toast {
+      position: fixed; top: 16px; right: 16px; padding: 12px 20px; border-radius: 12px;
+      font-size: 13px; font-weight: 600; z-index: 999; opacity: 0; transition: opacity .3s;
+    }
+    .toast.show { opacity: 1; }
+    .toast.ok { background: #def6de; color: #245d24; border: 1px solid #2f6b2f; }
+    .toast.err { background: #f7d8d8; color: #8b2222; border: 1px solid #a13131; }
+
+    @media (max-width: 900px) {
+      .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 600px) {
+      .wrap { padding: 14px; }
+      .grid { grid-template-columns: 1fr; }
+      .v { font-size: 28px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="topbar">
+      <div>
+        <h1>Cookie Manager</h1>
+        <div class="sub">管理猎聘 / BOSS / 智联等平台的 Cookie 文件与账号状态</div>
+      </div>
+      <div class="meta" id="meta">loading...</div>
+    </div>
+
+    <div class="nav">
+      <a href="/">抓取监控</a>
+      <a href="/scores">Score 结果</a>
+      <a class="active" href="/cookies">Cookie 管理</a>
+    </div>
+
+    <div class="grid" id="cards"></div>
+
+    <div class="panel">
+      <h2>Cookie 列表</h2>
+      <div class="controls">
+        <select id="platform-filter">
+          <option value="">全部平台</option>
+          <option value="liepin">liepin</option>
+          <option value="boss">boss</option>
+          <option value="zhilian">zhilian</option>
+        </select>
+        <select id="status-filter">
+          <option value="">全部状态</option>
+          <option value="ready">ready</option>
+          <option value="cooldown">cooldown</option>
+          <option value="needs_manual_verify">needs_manual_verify</option>
+          <option value="disabled">disabled</option>
+        </select>
+        <button id="refresh-btn" onclick="doRefresh()">刷新扫描</button>
+        <input id="phone-input" placeholder="手机号" style="width:140px">
+        <button id="add-btn" onclick="doAddCookie()">添加 Cookie</button>
+        <span id="add-status" style="font-size:12px;color:var(--muted)"></span>
+      </div>
+      <div id="cookies-table"></div>
+    </div>
+
+    <div id="toast" class="toast"></div>
+  </div>
+
+  <script>
+    const esc = (value) => {
+      if (value === null || value === undefined) return '';
+      return String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;');
+    };
+
+    const chip = (value, cls) => `<span class="chip ${cls || value}">${esc(value)}</span>`;
+
+    const makeTable = (columns, rows, formatters = {}) => {
+      if (!rows || !rows.length) return '<div class="empty">暂无数据，点击"刷新扫描"检测 cookies/ 目录</div>';
+      const head = columns.map(c => `<th>${esc(c.label)}</th>`).join('');
+      const body = rows.map(row =>
+        `<tr>${columns.map(c => {
+          const raw = row[c.key];
+          const html = formatters[c.key] ? formatters[c.key](raw, row) : esc(raw ?? '');
+          return `<td>${html}</td>`;
+        }).join('')}</tr>`
+      ).join('');
+      return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+    };
+
+    async function getJson(url, opts = {}) {
+      const res = await fetch(url, opts);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    }
+
+    function showToast(msg, ok = true) {
+      const el = document.getElementById('toast');
+      el.textContent = msg;
+      el.className = `toast ${ok ? 'ok' : 'err'} show`;
+      setTimeout(() => { el.className = 'toast'; }, 3000);
+    }
+
+    function renderCards(data) {
+      const profiles = data.profiles || [];
+      const ready = profiles.filter(p => p.status === 'ready').length;
+      const blocked = profiles.filter(p => p.status === 'needs_manual_verify').length;
+      const disabled = profiles.filter(p => p.status === 'disabled').length;
+      const cards = [
+        ['可用 Cookie', ready, 'status = ready'],
+        ['需验证', blocked, 'status = needs_manual_verify'],
+        ['总数', profiles.length, '全部 profile 记录'],
+      ];
+      document.getElementById('cards').innerHTML = cards.map(([k, v, note]) => `
+        <div class="card">
+          <div class="k">${esc(k)}</div>
+          <div class="v">${esc(v)}</div>
+          <div class="note">${esc(note)}</div>
+        </div>
+      `).join('');
+    }
+
+    async function loadCookies() {
+      const platform = document.getElementById('platform-filter').value;
+      const status = document.getElementById('status-filter').value;
+      const qs = new URLSearchParams();
+      if (platform) qs.set('platform', platform);
+      if (status) qs.set('status', status);
+
+      const data = await getJson(`/api/cookie-profiles?${qs.toString()}`);
+      renderCards(data);
+
+      document.getElementById('cookies-table').innerHTML = makeTable(
+        [
+          { key: 'platform', label: '平台' },
+          { key: 'profile_name', label: '账号 (手机号)' },
+          { key: 'status', label: '状态' },
+          { key: 'detail_count_today', label: '今日详情' },
+          { key: 'detail_total_count', label: '累计详情' },
+          { key: 'last_used_at', label: '最后使用' },
+          { key: 'notes', label: '备注' },
+        ],
+        data.profiles,
+        {
+          platform: (v) => `<span class="mono">${esc(v)}</span>`,
+          status: (v) => chip(v, v),
+          last_used_at: (v) => v ? esc(v).replace('T', ' ').slice(0, 16) : '<span class="muted">-</span>',
+          notes: (v) => {
+            const text = esc(v || '-');
+            // highlight tier info
+            return text.replace(/tier: (fresh|day_old|stale)/g, (_, t) =>
+              `<span class="chip ${t}">${t}</span>`
+            );
+          },
+        }
+      );
+
+      document.getElementById('meta').textContent = `自动刷新 30s | 最后刷新 ${new Date().toLocaleString()}`;
+    }
+
+    async function doRefresh() {
+      const btn = document.getElementById('refresh-btn');
+      btn.disabled = true;
+      btn.textContent = '扫描中...';
+      try {
+        const data = await getJson('/api/cookie-refresh', { method: 'POST' });
+        showToast(`扫描完成: 发现 ${data.found} 个, 清理 ${data.deleted} 个过期文件`);
+        await loadCookies();
+      } catch (err) {
+        showToast(`扫描失败: ${err.message}`, false);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '刷新扫描';
+      }
+    }
+
+    async function doAddCookie() {
+      const phoneInput = document.getElementById('phone-input');
+      const phone = phoneInput.value.trim();
+      if (!phone) { showToast('请输入手机号', false); return; }
+
+      const btn = document.getElementById('add-btn');
+      const status = document.getElementById('add-status');
+      btn.disabled = true;
+      btn.textContent = '登录中...';
+      status.textContent = '浏览器已打开，请在浏览器中完成登录...';
+
+      try {
+        const data = await getJson('/api/cookie-refresh-login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ phone }),
+        });
+        if (data.ok) {
+          showToast('Cookie 添加成功');
+          // Auto scan to pick up the new cookie
+          await doRefresh();
+        } else {
+          showToast(`登录失败: ${data.stderr || data.stdout || 'unknown'}`, false);
+        }
+      } catch (err) {
+        showToast(`请求失败: ${err.message}`, false);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '添加 Cookie';
+        status.textContent = '';
+      }
+    }
+
+    document.getElementById('platform-filter').addEventListener('change', loadCookies);
+    document.getElementById('status-filter').addEventListener('change', loadCookies);
+    setInterval(loadCookies, 30000);
+    loadCookies().catch(err => {
       document.getElementById('meta').textContent = `加载失败: ${err.message}`;
     });
   </script>
@@ -863,6 +1160,54 @@ class DashboardData:
         """
         return self.fetch_all(sql, tuple(params))
 
+    # ------------------------------------------------------------------
+    # cookie profiles
+    # ------------------------------------------------------------------
+
+    def cookie_profiles_list(
+        self, *, platform: str = "", status: str = ""
+    ) -> list[dict]:
+        sql = """
+            SELECT platform, profile_name, status,
+                   last_used_at, detail_count_today, detail_total_count,
+                   cooldown_until, last_error, last_error_at, notes,
+                   created_at, updated_at
+            FROM cookie_profiles
+            WHERE 1 = 1
+        """
+        params: list[str] = []
+        if platform:
+            sql += " AND platform = ?"
+            params.append(platform)
+        if status:
+            sql += " AND status = ?"
+            params.append(status)
+        sql += " ORDER BY platform, profile_name"
+        return self.fetch_all(sql, tuple(params))
+
+    def cookie_scan(self) -> dict:
+        """Run scan_and_cleanup and return stats."""
+        total_found = 0
+        for pf in ("liepin",):  # extend to boss, zhilian later
+            results = scan_and_cleanup(platform=pf)
+            total_found += len(results)
+        return {"found": total_found, "deleted": 0}
+
+    def cookie_login(self, phone: str) -> dict:
+        """Launch refresh_liepin_cookies.py in auto mode for a phone number."""
+        import subprocess
+
+        script = Path(__file__).resolve().parent / "tools" / "refresh_liepin_cookies.py"
+        python = sys.executable
+        cmd = [python, str(script), "--phone", phone, "--auto"]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        return {
+            "ok": result.returncode == 0,
+            "stdout": result.stdout[-500:] if result.stdout else "",
+            "stderr": result.stderr[-500:] if result.stderr else "",
+        }
+
+
 def make_handler(data: DashboardData):
     class Handler(BaseHTTPRequestHandler):
         def _json(self, payload: object, status: int = 200) -> None:
@@ -890,6 +1235,17 @@ def make_handler(data: DashboardData):
                     return
                 if parsed.path == "/scores":
                     self._html(SCORES_PAGE)
+                    return
+                if parsed.path == "/cookies":
+                    self._html(COOKIES_PAGE)
+                    return
+                if parsed.path == "/api/cookie-profiles":
+                    self._json({
+                        "profiles": data.cookie_profiles_list(
+                            platform=(query.get("platform") or [""])[0],
+                            status=(query.get("status") or [""])[0],
+                        )
+                    })
                     return
                 if parsed.path == "/api/summary":
                     self._json(data.summary())
@@ -926,6 +1282,31 @@ def make_handler(data: DashboardData):
                 self._json({"error": "not found"}, status=404)
             except sqlite3.OperationalError as exc:
                 self._json({"error": f"database error: {exc}"}, status=500)
+            except Exception as exc:
+                self._json({"error": f"server error: {exc}"}, status=500)
+
+        def do_POST(self) -> None:
+            parsed = urlparse(self.path)
+            try:
+                if parsed.path == "/api/cookie-refresh":
+                    result = data.cookie_scan()
+                    self._json(result)
+                    return
+                if parsed.path == "/api/cookie-refresh-login":
+                    content_length = int(self.headers.get("Content-Length", 0))
+                    body = json.loads(self.rfile.read(content_length)) if content_length else {}
+                    phone = str(body.get("phone", "")).strip()
+                    if not phone:
+                        self._json({"ok": False, "error": "phone is required"}, status=400)
+                        return
+                    print(f"[dashboard] cookie-refresh-login phone={phone}")
+                    result = data.cookie_login(phone)
+                    # After login, run scan to sync new cookie
+                    if result["ok"]:
+                        data.cookie_scan()
+                    self._json(result)
+                    return
+                self._json({"error": "not found"}, status=404)
             except Exception as exc:
                 self._json({"error": f"server error: {exc}"}, status=500)
 

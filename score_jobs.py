@@ -2,7 +2,7 @@ import argparse
 import json
 
 from ai.prompts import PROMPT_VERSION, build_user_prompt
-from config import AI_CONFIG, PATHS
+from config import AI_CONFIG, PATHS, normalize_keyword
 from storage.database import Database
 
 
@@ -47,6 +47,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    args.keyword = normalize_keyword(args.keyword)
     database = Database(PATHS["database"])
     database.init()
 

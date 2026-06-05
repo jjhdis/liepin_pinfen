@@ -1,7 +1,13 @@
 import argparse
 import json
+from datetime import datetime
 from pathlib import Path
+from typing import Optional
 from urllib.parse import unquote
+
+
+BASE_DIR = Path(__file__).resolve().parents[1]
+DEFAULT_OUTPUT_DIR = BASE_DIR / "cookies"
 
 
 def parse_cookie_string(cookie_string: str, domain: str, path: str) -> list[dict]:
@@ -37,9 +43,21 @@ def parse_cookie_string(cookie_string: str, domain: str, path: str) -> list[dict
     return cookies
 
 
+def _sanitize_phone_for_filename(phone: Optional[str]) -> str:
+    digits = "".join(ch for ch in (phone or "") if ch.isdigit())
+    return digits or "unknown"
+
+
+def _build_default_output_path(output_dir: str, phone: Optional[str]) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    phone_tag = _sanitize_phone_for_filename(phone)
+    filename = f"cookie_{timestamp}_{phone_tag}_liepin.json"
+    return Path(output_dir) / filename
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Convert a raw browser cookie string into Playwright cookies.json format."
+        description="Convert a raw browser cookie string into a named Playwright cookie JSON file."
     )
     parser.add_argument(
         "cookie_string",
@@ -47,8 +65,16 @@ def main() -> None:
     )
     parser.add_argument(
         "--output",
-        default="cookies.json",
-        help="Output JSON file path. Default: cookies.json",
+        help="Output JSON file path. Overrides the auto-generated filename.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=str(DEFAULT_OUTPUT_DIR),
+        help="Directory used for auto-generated cookie files. Default: project_root/cookies",
+    )
+    parser.add_argument(
+        "--phone",
+        help="Optional phone number tag used in the generated filename.",
     )
     parser.add_argument(
         "--domain",
@@ -73,7 +99,8 @@ def main() -> None:
         path=args.path,
     )
 
-    output_path = Path(args.output)
+    output_path = Path(args.output) if args.output else _build_default_output_path(args.output_dir, args.phone)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
         json.dumps(cookies, ensure_ascii=False, indent=2),
         encoding="utf-8",

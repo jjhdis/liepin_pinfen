@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from company_evidence_filter import filter_search_results
-from config import PATHS, ZHIHU_CONFIG
+from config import PATHS, ZHIHU_CONFIG, normalize_keyword
 from crawler.zhihu_client import ZhihuClientError, ZhihuHTTPError, ZhihuSearchClient
 from storage.database import Database
 
@@ -13,7 +13,7 @@ def parse_args() -> argparse.Namespace:
         description="Enrich risky companies with Zhihu search summaries."
     )
     parser.add_argument("--keyword", help="Optional keyword filter.")
-    parser.add_argument("--limit", type=int, default=5, help="Maximum companies to process.")
+    parser.add_argument("--limit", type=int, default=None, help="Maximum companies to process. Default: all pending.")
     parser.add_argument(
         "--refresh",
         action="store_true",
@@ -56,13 +56,20 @@ def _build_risk_summary(evidence_items: list[dict[str, Any]]) -> tuple[str, list
 
 def main() -> None:
     args = parse_args()
+    args.keyword = normalize_keyword(args.keyword)
     database = Database(PATHS["database"])
     database.init()
 
+    effective_limit = args.limit if args.limit is not None else ZHIHU_CONFIG["max_requests_per_run"]
     companies = database.get_companies_ready_for_enrichment(
         keyword=args.keyword,
-        limit=args.limit,
+        limit=effective_limit,
     )
+    if args.limit is None:
+        print(
+            f"[company-enrich] using safety cap limit={effective_limit} "
+            f"(from ZHIHU_CONFIG max_requests_per_run)"
+        )
     if not companies:
         print("[company-enrich] no companies ready for enrichment")
         return

@@ -14,7 +14,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--keyword", help="Optional keyword filter shared by all stages.")
 
-    parser.add_argument("--clean-limit", type=int, help="Maximum source rows to clean.")
+    parser.add_argument("--clean-limit", type=int, default=50, help="Maximum source rows to clean. Default: 50.")
     parser.add_argument(
         "--clean-only-missing",
         action="store_true",
@@ -24,8 +24,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--enrich-limit",
         type=int,
-        default=5,
-        help="Maximum companies to enrich in one run. Default: 5",
+        default=None,
+        help="Maximum companies to enrich in one run. Default: all pending.",
     )
     parser.add_argument(
         "--enrich-refresh",
@@ -80,7 +80,8 @@ def main() -> None:
     enrich_args: list[str] = []
     if args.keyword:
         enrich_args.extend(["--keyword", args.keyword])
-    enrich_args.extend(["--limit", str(args.enrich_limit)])
+    if args.enrich_limit is not None:
+        enrich_args.extend(["--limit", str(args.enrich_limit)])
     if args.enrich_refresh:
         enrich_args.append("--refresh")
 
