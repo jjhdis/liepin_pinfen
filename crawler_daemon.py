@@ -115,10 +115,30 @@ class CrawlerDaemon:
     # ---- reaping -----------------------------------------------------------
 
     def _reap_finished(self) -> None:
-        """Check each running subprocess; update DB if it exited."""
+        """Check each running subprocess; update DB if it exited or was cancelled."""
         finished: list[str] = []
         for task_id, entry in list(self._running.items()):
             proc = entry["proc"]
+
+            # Check if user cancelled this task via dashboard
+            if self._is_task_cancelled(task_id):
+                log(f"task={task_id} cancelled by user, killing pid={proc.pid}")
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    log(f"task={task_id} did not exit after SIGTERM, force-killing")
+                    proc.kill()
+                    proc.wait()
+                except Exception:
+                    proc.kill()
+                self.db.update_task_run(
+                    task_id, status="cancelled",
+                    error_message="killed by user",
+                )
+                finished.append(task_id)
+                continue
+
             ret = proc.poll()
             if ret is not None:
                 status = "completed" if ret == 0 else "failed"
@@ -135,6 +155,19 @@ class CrawlerDaemon:
 
         for tid in finished:
             del self._running[tid]
+
+    def _is_task_cancelled(self, task_id: str) -> bool:
+        """Check if a task has been marked cancelled in the DB."""
+        import sqlite3
+        conn = self.db.connect()
+        try:
+            row = conn.execute(
+                "SELECT status FROM task_runs WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            return row is not None and row["status"] == "cancelled"
+        finally:
+            conn.close()
 
     def _maybe_chain_detail(self, task_entry: dict) -> None:
         """If a list task completed, check for new pending jobs and auto-create
