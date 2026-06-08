@@ -1158,10 +1158,9 @@ CRAWL_PAGE = """<!doctype html>
         </div>
 
         <div style="margin-bottom:12px">
-          <label style="font-size:13px;color:var(--muted)">Keyword（仅列表抓取）</label>
-          <select id="keyword-select" style="width:100%;margin-top:4px">
-            <option value="">全部</option>
-          </select>
+          <label style="font-size:13px;color:var(--muted)">Keyword（仅列表抓取，可多选）</label>
+          <div id="keyword-checkboxes" style="margin-top:4px;display:flex;gap:12px;flex-wrap:wrap">
+          </div>
         </div>
 
         <div style="margin-bottom:12px">
@@ -1256,11 +1255,12 @@ CRAWL_PAGE = """<!doctype html>
       if (!_keywordsLoaded) {
         try {
           const keywords = await getJson('/api/crawl/keywords');
-          const kwSel = document.getElementById('keyword-select');
-          kwSel.innerHTML = '<option value="">全部</option>';
-          keywords.forEach(kw => {
-            kwSel.innerHTML += `<option value="${esc(kw)}">${esc(kw)}</option>`;
-          });
+          const container = document.getElementById('keyword-checkboxes');
+          container.innerHTML = keywords.map(kw =>
+            `<label style="font-size:13px;cursor:pointer;white-space:nowrap">
+              <input type="checkbox" value="${esc(kw)}" class="kw-cb"> ${esc(kw)}
+            </label>`
+          ).join('');
           _keywordsLoaded = true;
         } catch(e) {}
       }
@@ -1345,29 +1345,36 @@ CRAWL_PAGE = """<!doctype html>
 
     async function startList() {
       const platform = document.getElementById('platform-select').value;
-      const keyword = document.getElementById('keyword-select').value;
       const profile = document.getElementById('cookie-select').value;
       const storeTopN = document.getElementById('store-top-n').value;
 
-      if (!keyword) { showToast('请选择 keyword', false); return; }
+      const checked = document.querySelectorAll('.kw-cb:checked');
+      const keywords = Array.from(checked).map(cb => cb.value);
+      if (!keywords.length) { showToast('请至少选择一个 keyword', false); return; }
 
       setButtons(false);
-      document.getElementById('action-status').innerHTML = '<span class="spinner"></span>启动中...';
-      try {
-        const data = await getJson('/api/crawl/list', {
-          method: 'POST',
-          headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({ platform, keyword, cookie_profile_name: profile || undefined, store_top_n: parseInt(storeTopN) }),
-        });
-        if (data.error) { showToast(data.error, false); }
-        else { showToast(`列表抓取已启动: ${data.task_id}`); }
-      } catch (err) {
-        showToast(`请求失败: ${err.message}`, false);
-      } finally {
-        setButtons(true);
-        document.getElementById('action-status').textContent = '';
-        loadPage();
+      const status = document.getElementById('action-status');
+      const submitted = [];
+      for (const kw of keywords) {
+        status.innerHTML = `<span class="spinner"></span>提交 ${esc(kw)} ...`;
+        try {
+          const data = await getJson('/api/crawl/list', {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ platform, keyword: kw, cookie_profile_name: profile || undefined, store_top_n: parseInt(storeTopN) }),
+          });
+          if (data.error) { showToast(`${kw}: ${data.error}`, false); }
+          else { submitted.push(kw); }
+        } catch (err) {
+          showToast(`${kw}: ${err.message}`, false);
+        }
       }
+      if (submitted.length) {
+        showToast(`已提交 ${submitted.length} 个任务: ${submitted.join(', ')}`);
+      }
+      setButtons(true);
+      status.textContent = '';
+      loadPage();
     }
 
     async function startDetail() {

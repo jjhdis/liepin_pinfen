@@ -171,21 +171,34 @@ class CrawlerDaemon:
 
     def _maybe_chain_detail(self, task_entry: dict) -> None:
         """If a list task completed, check for new pending jobs and auto-create
-        a detail task."""
+        a detail task.  Only fires when ALL list tasks for the platform are done,
+        so detail gets the full batch of pending jobs for cookie rotation."""
         platform = task_entry.get("platform", "liepin")
         keyword = task_entry.get("keyword")
         list_task_id = task_entry.get("task_id", "")
 
-        # Check if we already have a queued/running detail for this platform
+        # Don't create detail if there are still queued list tasks
+        all_queued = self.db.get_queued_tasks(platform=platform, limit=100)
+        has_more_lists = any(
+            t.get("task_type") == "list" for t in all_queued
+        )
+        if has_more_lists:
+            log(f"auto-chain: list={list_task_id} done but more list tasks queued, waiting")
+            return
+
+        # Check if we already have a running detail for this platform
         running = self.db.get_running_task(platform)
         if running:
             return
-        queued = self.db.get_queued_tasks(platform=platform, limit=1)
-        if queued:
-            return  # already has a detail queued
+        # Check if a detail is already queued
+        has_detail_queued = any(
+            t.get("task_type") == "detail" for t in all_queued
+        )
+        if has_detail_queued:
+            return
 
-        # Check pending count
-        pending = self.db.pending_job_count(keyword=keyword)
+        # Check pending count (all keywords, since detail processes everything)
+        pending = self.db.pending_job_count(keyword=None)
         if pending <= 0:
             log(f"auto-chain: list={list_task_id} done but pending=0, skip detail")
             return
