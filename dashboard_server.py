@@ -1086,9 +1086,11 @@ CRAWL_PAGE = """<!doctype html>
       display: inline-flex; align-items: center; padding: 2px 9px; border-radius: 999px;
       font-size: 12px; font-weight: 600; border: 1px solid currentColor; white-space: nowrap;
     }
+    .chip.queued { color: #555; background: #eee; }
     .chip.running { color: #7d6200; background: #fff3cc; }
     .chip.completed { color: #245d24; background: #def6de; }
     .chip.failed { color: #8b2222; background: #f7d8d8; }
+    .chip.cancelled { color: #8a5410; background: #f7e4c7; }
 
     .mono { font-family: Consolas, "Courier New", monospace; font-size: 12px; }
     .muted { color: var(--muted); }
@@ -1281,7 +1283,7 @@ CRAWL_PAGE = """<!doctype html>
       renderCards(status);
 
       // --- active tasks (queued + running) ---
-      const activeTasks = data.active_tasks || [];
+      const activeTasks = status.active_tasks || [];
       document.getElementById('running-table').innerHTML = makeTable(
         [
           { key: 'task_id', label: '任务ID' },
