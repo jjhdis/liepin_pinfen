@@ -1,12 +1,24 @@
+"""Rotate available Liepin cookies with cooldown-aware reuse.
+
+Each cookie runs one detail batch, gets a cooldown, then the loop continues
+with the next available cookie.  If all cookies are in cooldown the script
+reports the earliest recovery time and exits (it does NOT block).
+"""
+
 import argparse
+import json
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from config import PATHS, RUN_CONFIG, normalize_keyword
 from cookie_manager import (
+    get_earliest_cooldown_expiry,
+    get_usable_profiles,
     mark_profile_blocked,
+    mark_profile_cooldown,
     mark_profile_used,
     scan_and_cleanup,
 )
@@ -21,8 +33,9 @@ DEFAULT_PLATFORM = "liepin"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Rotate available Liepin cookies. "
-            "Each cookie runs one detail batch, then switch to the next."
+            "Rotate available Liepin cookies with cooldown-aware reuse. "
+            "Keeps running until pending jobs are exhausted or all cookies "
+            "enter cooldown."
         )
     )
     parser.add_argument("--keyword", help="Optional keyword filter for detail batches.")
@@ -30,13 +43,31 @@ def parse_args() -> argparse.Namespace:
         "--per-cookie-detail",
         type=int,
         default=25,
-        help="How many detail jobs to process per cookie. Default: 25",
+        help="How many detail jobs to process per cookie per round. Default: 25",
     )
     parser.add_argument(
         "--max-cookies",
         type=int,
         default=RUN_CONFIG.get("cookie_max_per_run"),
-        help="Max cookies to use. Default: config cookie_max_per_run.",
+        help="Max distinct cookies to use across the whole run. Default: config cookie_max_per_run.",
+    )
+    parser.add_argument(
+        "--max-rounds",
+        type=int,
+        default=0,
+        help="Max reuse rounds (0 = unlimited). Each cookie can be reused at most N times across rounds.",
+    )
+    parser.add_argument(
+        "--cooldown-hours",
+        type=float,
+        default=RUN_CONFIG.get("cookie_cooldown_hours", 2),
+        help="Cooldown hours after each cookie batch. Default: config cookie_cooldown_hours.",
+    )
+    parser.add_argument(
+        "--daily-max",
+        type=int,
+        default=RUN_CONFIG.get("cookie_daily_max_detail", 0),
+        help="Max detail jobs per cookie per day. 0 = unlimited. Default: config cookie_daily_max_detail.",
     )
     parser.add_argument(
         "--min-delay",
@@ -77,7 +108,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Only print planned cookie batches without executing them.",
+        help="Only print planned actions without executing them.",
+    )
+    parser.add_argument(
+        "--output-json",
+        action="store_true",
+        help="Output a JSON summary line at the end (for API consumers).",
     )
     return parser.parse_args()
 
@@ -169,6 +205,36 @@ def _maybe_trigger_postprocess(
         )
 
 
+def _pick_best_cookie(
+    all_cookies: list[dict],
+    used_in_run: set[str],
+    args: argparse.Namespace,
+) -> Optional[dict]:
+    """Select the best available cookie from the pre-scanned pool.
+
+    Only considers cookies that were in the original scan (all_cookies),
+    haven't exceeded their per-run round limit, and are currently usable
+    (ready or cooldown-expired) according to the DB.
+    """
+    usable = get_usable_profiles(platform=args.platform, daily_max=args.daily_max)
+    if not usable:
+        return None
+
+    usable_map = {p["profile_name"]: p for p in usable}
+
+    for cookie in all_cookies:
+        pn = cookie["profile_name"]
+        if pn not in usable_map:
+            continue
+        # Per-run round limit
+        round_count = sum(1 for u in used_in_run if u == pn)
+        if args.max_rounds > 0 and round_count >= args.max_rounds:
+            continue
+        return cookie
+
+    return None
+
+
 def main() -> None:
     args = parse_args()
     args.keyword = normalize_keyword(args.keyword)
@@ -191,29 +257,63 @@ def main() -> None:
         f"[cookie-rotate] platform={args.platform} "
         f"keyword={args.keyword or 'ALL'} "
         f"cookies={len(cookies)} pending_total={initial_pending} "
-        f"per_cookie_detail={args.per_cookie_detail}"
+        f"per_cookie_detail={args.per_cookie_detail} "
+        f"cooldown_hours={args.cooldown_hours} daily_max={args.daily_max} "
+        f"max_rounds={args.max_rounds or 'unlimited'}"
     )
 
-    # --- Step 2: rotate ---
-    for index, item in enumerate(cookies, start=1):
+    # --- Step 2: reuse-aware rotation ---
+    batch_index = 0
+    used_in_run: set[str] = set()  # track which profiles were used (for max_rounds)
+    errors: list[dict] = []
+
+    while True:
         remaining = pending_count(args.keyword)
         if remaining <= 0:
-            print("[cookie-rotate] no pending jobs left, stop rotation")
+            print("[cookie-rotate] no pending jobs left, all done")
             break
 
-        cookie_path = item["path"]
-        profile_name = item["profile_name"]
-        tier = item["tier"]
+        cookie = _pick_best_cookie(cookies, used_in_run, args)
+        if cookie is None:
+            # No usable cookie — report and exit
+            earliest = get_earliest_cooldown_expiry(args.platform)
+            if earliest:
+                print(
+                    f"[cookie-rotate] all cookies in cooldown / at limit. "
+                    f"earliest_recovery={earliest} pending_remaining={remaining}"
+                )
+            else:
+                print(
+                    f"[cookie-rotate] no usable cookies available. "
+                    f"pending_remaining={remaining}"
+                )
+            break
+
+        cookie_path = cookie["path"]
+        profile_name = cookie["profile_name"]
+        tier = cookie["tier"]
+        batch_index += 1
+        used_in_run.add(profile_name)
 
         command = build_detail_command(args, cookie_path.name, profile_name)
         print(
-            f"[cookie-rotate] batch={index}/{len(cookies)} "
+            f"[cookie-rotate] batch={batch_index} "
             f"cookie={cookie_path.name} tier={tier} "
             f"profile={profile_name} pending_before={remaining}"
         )
         print(f"[cookie-rotate] command={' '.join(command)}")
 
         if args.dry_run:
+            print(
+                f"[cookie-rotate-dry-run] would run detail batch, "
+                f"then cooldown {args.cooldown_hours}h"
+            )
+            # In dry-run, simulate cooldown so we move to next cookie
+            mark_profile_cooldown(
+                platform=args.platform,
+                profile_name=profile_name,
+                hours=int(args.cooldown_hours),
+            )
             continue
 
         completed = subprocess.run(command, cwd=BASE_DIR)
@@ -227,7 +327,11 @@ def main() -> None:
                 profile_name=profile_name,
                 reason=f"detail exit_code={completed.returncode}",
             )
-            # Continue with next cookie instead of hard-exit
+            errors.append({
+                "profile_name": profile_name,
+                "cookie_file": cookie_path.name,
+                "exit_code": completed.returncode,
+            })
             print(
                 f"[cookie-rotate] switching to next cookie after failure, "
                 f"profile={profile_name} marked needs_manual_verify"
@@ -240,6 +344,13 @@ def main() -> None:
             profile_name=profile_name,
         )
 
+        # Set cooldown after successful batch
+        mark_profile_cooldown(
+            platform=args.platform,
+            profile_name=profile_name,
+            hours=int(args.cooldown_hours),
+        )
+
         # Auto postprocess check after each successful batch
         _maybe_trigger_postprocess(
             keyword=args.keyword,
@@ -247,11 +358,27 @@ def main() -> None:
             cookie_label=cookie_path.name,
         )
 
+    # --- Summary ---
     final_pending = pending_count(args.keyword)
-    print(
+    summary = (
         f"[cookie-rotate-summary] keyword={args.keyword or 'ALL'} "
+        f"batches={batch_index} errors={len(errors)} "
         f"pending_before={initial_pending} pending_after={final_pending}"
     )
+    print(summary)
+
+    if args.output_json:
+        result = {
+            "keyword": args.keyword,
+            "platform": args.platform,
+            "batches": batch_index,
+            "errors": len(errors),
+            "pending_before": initial_pending,
+            "pending_after": final_pending,
+            "error_details": errors,
+            "completed_at": datetime.utcnow().isoformat(timespec="seconds"),
+        }
+        print("[cookie-rotate-json]", json.dumps(result, ensure_ascii=False))
 
 
 if __name__ == "__main__":

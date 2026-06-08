@@ -212,6 +212,40 @@ def get_available_profiles(platform: str = "liepin") -> list[dict[str, Any]]:
     return db.get_ready_cookie_profiles(platform)
 
 
+def get_usable_profiles(
+    platform: str = "liepin",
+    *,
+    daily_max: int = 0,
+) -> list[dict[str, Any]]:
+    """Query cookie_profiles for usable profiles (ready + cooldown-expired)."""
+    db = Database(PATHS["database"])
+    db.init()
+    return db.get_usable_cookie_profiles(platform, daily_max=daily_max)
+
+
+def mark_profile_cooldown(
+    platform: str,
+    profile_name: str,
+    *,
+    hours: int = 2,
+) -> None:
+    """Set a cookie profile into cooldown state for *hours* hours."""
+    db = Database(PATHS["database"])
+    db.init()
+    db.mark_cookie_cooldown(platform, profile_name, hours=hours)
+    print(
+        f"[cookie-manager] mark_cooldown platform={platform} "
+        f"profile={profile_name} hours={hours}"
+    )
+
+
+def get_earliest_cooldown_expiry(platform: str = "liepin") -> Optional[str]:
+    """Return the earliest cooldown expiry time for the platform."""
+    db = Database(PATHS["database"])
+    db.init()
+    return db.get_earliest_cooldown_expiry(platform)
+
+
 def _TIER_LABEL(tier: str) -> str:
     if tier == "day_old":
         return "[WARN] day-old cookie, may trigger captcha"

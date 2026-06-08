@@ -389,6 +389,35 @@ class Database:
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS task_runs (
+                    task_id      TEXT PRIMARY KEY,
+                    platform     TEXT NOT NULL,
+                    task_type    TEXT NOT NULL,
+                    status       TEXT NOT NULL DEFAULT 'queued',
+                    keyword      TEXT,
+                    profile_name TEXT,
+                    pid          INTEGER,
+                    priority     INTEGER NOT NULL DEFAULT 0,
+                    parent_task_id TEXT,
+                    progress_json TEXT,
+                    started_at   TEXT NOT NULL,
+                    finished_at  TEXT,
+                    result_json  TEXT,
+                    error_message TEXT,
+                    created_at   TEXT NOT NULL
+                )
+                """
+            )
+            # Migrate existing task_runs table
+            task_runs_cols = _table_info(conn, "task_runs")
+            if "priority" not in task_runs_cols:
+                conn.execute("ALTER TABLE task_runs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
+            if "parent_task_id" not in task_runs_cols:
+                conn.execute("ALTER TABLE task_runs ADD COLUMN parent_task_id TEXT")
+            if "progress_json" not in task_runs_cols:
+                conn.execute("ALTER TABLE task_runs ADD COLUMN progress_json TEXT")
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS cookie_profiles (
                     platform TEXT NOT NULL,
                     profile_name TEXT NOT NULL,
@@ -1317,3 +1346,276 @@ class Database:
                 (platform,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def get_usable_cookie_profiles(
+        self,
+        platform: str,
+        *,
+        daily_max: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Return profiles that are ready OR cooldown-expired, ordered by priority.
+
+        Priority: ready > cooldown (expired), then least used today, then
+        least recently used.  Excludes profiles over ``daily_max`` when > 0.
+        """
+        sql = """
+            SELECT *
+            FROM cookie_profiles
+            WHERE platform = ?
+              AND status IN ('ready', 'cooldown')
+              AND (status = 'ready' OR cooldown_until <= datetime('now'))
+        """
+        params: list[Any] = [platform]
+
+        if daily_max > 0:
+            sql += " AND detail_count_today < ?"
+            params.append(daily_max)
+
+        sql += """
+            ORDER BY
+              CASE status WHEN 'ready' THEN 0 WHEN 'cooldown' THEN 1 END,
+              detail_count_today ASC,
+              last_used_at ASC
+        """
+        with closing(self.connect()) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_cookie_cooldown(
+        self,
+        platform: str,
+        profile_name: str,
+        *,
+        hours: int = 2,
+    ) -> None:
+        """Set a cookie profile into cooldown for *hours* hours."""
+        now = datetime.utcnow().isoformat(timespec="seconds")
+        with closing(self.connect()) as conn:
+            conn.execute(
+                """
+                UPDATE cookie_profiles
+                SET status = 'cooldown',
+                    cooldown_until = datetime('now', ?),
+                    updated_at = ?
+                WHERE platform = ? AND profile_name = ?
+                """,
+                (f"+{hours} hours", now, platform, profile_name),
+            )
+            conn.commit()
+
+    def get_earliest_cooldown_expiry(
+        self, platform: str
+    ) -> Optional[str]:
+        """Return the earliest cooldown_until for profiles in cooldown."""
+        with closing(self.connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT MIN(cooldown_until) AS earliest
+                FROM cookie_profiles
+                WHERE platform = ?
+                  AND status = 'cooldown'
+                  AND cooldown_until > datetime('now')
+                """,
+                (platform,),
+            ).fetchone()
+        return row["earliest"] if row and row["earliest"] else None
+
+    # ------------------------------------------------------------------
+    # task_runs
+    # ------------------------------------------------------------------
+
+    def create_task_run(
+        self,
+        *,
+        task_id: str,
+        platform: str,
+        task_type: str,
+        keyword: Optional[str] = None,
+        profile_name: Optional[str] = None,
+        pid: Optional[int] = None,
+        status: str = "queued",
+        priority: int = 0,
+        parent_task_id: Optional[str] = None,
+    ) -> None:
+        now = datetime.utcnow().isoformat(timespec="seconds")
+        with closing(self.connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO task_runs (
+                    task_id, platform, task_type, status, keyword,
+                    profile_name, pid, priority, parent_task_id,
+                    started_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (task_id, platform, task_type, status, keyword, profile_name, pid, priority, parent_task_id, now, now),
+            )
+            conn.commit()
+
+    def update_task_run(
+        self,
+        task_id: str,
+        *,
+        status: str,
+        pid: Optional[int] = None,
+        result_json: Optional[str] = None,
+        error_message: Optional[str] = None,
+        progress_json: Optional[str] = None,
+    ) -> None:
+        now = datetime.utcnow().isoformat(timespec="seconds")
+        sql = "UPDATE task_runs SET status = ?, finished_at = ?"
+        params: list[Any] = [status, now]
+
+        if pid is not None:
+            sql += ", pid = ?"
+            params.append(pid)
+        if result_json is not None:
+            sql += ", result_json = ?"
+            params.append(result_json)
+        if error_message is not None:
+            sql += ", error_message = ?"
+            params.append(error_message)
+        if progress_json is not None:
+            sql += ", progress_json = ?"
+            params.append(progress_json)
+
+        sql += " WHERE task_id = ?"
+        params.append(task_id)
+
+        with closing(self.connect()) as conn:
+            conn.execute(sql, params)
+            conn.commit()
+
+    def get_running_task(self, platform: str) -> Optional[dict[str, Any]]:
+        with closing(self.connect()) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT *
+                FROM task_runs
+                WHERE platform = ? AND status = 'running'
+                ORDER BY started_at DESC
+                LIMIT 1
+                """,
+                (platform,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_running_tasks_all(self) -> list[dict[str, Any]]:
+        """Return all running tasks across all platforms (with pid for reaping)."""
+        with closing(self.connect()) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM task_runs
+                WHERE status = 'running'
+                ORDER BY started_at ASC
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_queued_tasks(
+        self,
+        *,
+        platform: str = "",
+        limit: int = 1,
+    ) -> list[dict[str, Any]]:
+        """Return queued tasks ordered by priority then created_at."""
+        sql = """
+            SELECT *
+            FROM task_runs
+            WHERE status = 'queued'
+        """
+        params: list[Any] = []
+        if platform:
+            sql += " AND platform = ?"
+            params.append(platform)
+        sql += " ORDER BY priority ASC, created_at ASC LIMIT ?"
+        params.append(limit)
+
+        with closing(self.connect()) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def cancel_task(self, task_id: str) -> bool:
+        """Cancel a queued or running task. Returns True if updated."""
+        with closing(self.connect()) as conn:
+            cursor = conn.execute(
+                """
+                UPDATE task_runs
+                SET status = 'cancelled', finished_at = ?
+                WHERE task_id = ? AND status IN ('queued', 'running')
+                """,
+                (datetime.utcnow().isoformat(timespec="seconds"), task_id),
+            )
+            conn.commit()
+        return cursor.rowcount > 0
+
+    def get_task_runs(
+        self,
+        *,
+        platform: str = "",
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        sql = """
+            SELECT *
+            FROM task_runs
+            WHERE 1 = 1
+        """
+        params: list[Any] = []
+        if platform:
+            sql += " AND platform = ?"
+            params.append(platform)
+        sql += " ORDER BY started_at DESC LIMIT ?"
+        params.append(limit)
+
+        with closing(self.connect()) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def crawl_status(self) -> dict[str, Any]:
+        """Aggregate status for the crawl API."""
+        pending_detail = self.pending_job_count()
+        pending_clean = self.ready_for_clean_count()
+        pending_score = self.ready_for_scoring_count()
+
+        active_tasks = []
+        with closing(self.connect()) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT task_id, platform, task_type, status, keyword,
+                       profile_name, priority, parent_task_id, started_at
+                FROM task_runs
+                WHERE status IN ('queued', 'running')
+                ORDER BY priority ASC, started_at ASC
+                """
+            ).fetchall()
+            active_tasks = [dict(row) for row in rows]
+
+        last_completed = None
+        with closing(self.connect()) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT task_id, platform, task_type, status, keyword,
+                       profile_name, started_at, finished_at
+                FROM task_runs
+                WHERE status IN ('completed', 'failed')
+                ORDER BY finished_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if row:
+                last_completed = dict(row)
+
+        return {
+            "pending_detail": pending_detail,
+            "pending_cleaned": pending_clean,
+            "pending_score": pending_score,
+            "active_tasks": active_tasks,
+            "last_completed_task": last_completed,
+        }

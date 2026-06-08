@@ -1,0 +1,438 @@
+"""Crawler daemon — independent background process that manages crawl tasks.
+
+Runs continuously, polling task_runs for queued tasks, launching them as
+subprocesses, and updating their status.  Dashboard can be started/stopped
+independently without affecting running crawls.
+
+Usage::
+
+    python crawler_daemon.py              # foreground (debug)
+    python crawler_daemon.py --daemon     # background (daemonize)
+    python crawler_daemon.py --stop       # stop a running daemon
+"""
+
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+from config import PATHS, RUN_CONFIG, normalize_keyword
+from cookie_manager import scan_and_cleanup
+from storage.database import Database
+
+BASE_DIR = Path(__file__).resolve().parent
+PYTHON_EXE = BASE_DIR / ".venv" / "Scripts" / "python.exe"
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+def get_python() -> str:
+    if PYTHON_EXE.exists():
+        return str(PYTHON_EXE)
+    return sys.executable
+
+
+def now_iso() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds")
+
+
+def log(msg: str) -> None:
+    print(f"[daemon {now_iso()}] {msg}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# task command builders
+# ---------------------------------------------------------------------------
+
+def _build_list_cmd(task: dict) -> list[str]:
+    keyword = task.get("keyword") or ""
+    profile_name = task.get("profile_name") or ""
+    cookie_file = ""
+    if profile_name:
+        cookie_dir = PATHS["cookie_dir"]
+        platform = task.get("platform", "liepin")
+        candidates = sorted(
+            cookie_dir.glob(f"cookie_*_{profile_name}_{platform}.json"),
+            reverse=True,
+        )
+        if candidates:
+            cookie_file = candidates[0].name
+
+    cmd = [
+        get_python(), str(BASE_DIR / "main.py"), "list",
+        "--keyword", keyword,
+        "--store-top-n", str(RUN_CONFIG["list"]["store_top_n"]),
+    ]
+    if cookie_file:
+        cmd.extend(["--cookie-file", cookie_file])
+    return cmd
+
+
+def _build_detail_cmd(task: dict) -> list[str]:
+    platform = task.get("platform", "liepin")
+    profile_name = task.get("profile_name") or ""
+    cmd = [
+        get_python(), str(BASE_DIR / "rotate_liepin_cookies.py"),
+        "--platform", platform,
+        "--output-json",
+    ]
+    if profile_name:
+        cmd.extend(["--max-cookies", "1"])
+    return cmd
+
+
+def _build_postprocess_cmd(task: dict) -> list[str]:  # noqa: ARG001
+    return [get_python(), str(BASE_DIR / "postprocess_pipeline.py")]
+
+
+TASK_BUILDERS = {
+    "list": _build_list_cmd,
+    "detail": _build_detail_cmd,
+    "postprocess": _build_postprocess_cmd,
+}
+
+
+# ---------------------------------------------------------------------------
+# daemon core
+# ---------------------------------------------------------------------------
+
+class CrawlerDaemon:
+    def __init__(self, db: Database, platform_filter: str = "") -> None:
+        self.db = db
+        self.platform_filter = platform_filter
+        self._running: dict[str, subprocess.Popen] = {}  # task_id → Popen
+        self._last_cookie_scan = 0.0
+        self._shutdown = False
+
+    # ---- reaping -----------------------------------------------------------
+
+    def _reap_finished(self) -> None:
+        """Check each running subprocess; update DB if it exited."""
+        finished: list[str] = []
+        for task_id, proc in list(self._running.items()):
+            ret = proc.poll()
+            if ret is not None:
+                status = "completed" if ret == 0 else "failed"
+                err_msg = None if ret == 0 else f"exit_code={ret}"
+                self.db.update_task_run(
+                    task_id, status=status, error_message=err_msg,
+                )
+                finished.append(task_id)
+                log(f"task={task_id} finished status={status} exit={ret}")
+
+                # ---- auto-chain: list → detail ----
+                if status == "completed":
+                    self._maybe_chain_detail(task_id)
+
+        for tid in finished:
+            del self._running[tid]
+
+    def _maybe_chain_detail(self, list_task_id: str) -> None:
+        """If a list task completed, check for new pending jobs and auto-create
+        a detail task."""
+        # Load the completed list task
+        tasks = self.db.get_task_runs(limit=1)
+        list_task = None
+        for t in tasks:
+            if t["task_id"] == list_task_id:
+                list_task = t
+                break
+        if not list_task or list_task.get("task_type") != "list":
+            return
+
+        platform = list_task.get("platform", "liepin")
+        keyword = list_task.get("keyword")
+
+        # Check if we already have a queued/running detail for this platform
+        running = self.db.get_running_task(platform)
+        if running:
+            return
+        queued = self.db.get_queued_tasks(platform=platform, limit=1)
+        if queued:
+            return  # already has a detail queued
+
+        # Check pending count
+        pending = self.db.pending_job_count(keyword=keyword)
+        if pending <= 0:
+            log(f"auto-chain: list={list_task_id} done but pending=0, skip detail")
+            return
+
+        # Create detail task
+        import uuid
+        detail_id = f"task_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        self.db.create_task_run(
+            task_id=detail_id,
+            platform=platform,
+            task_type="detail",
+            keyword=keyword,
+            status="queued",
+            parent_task_id=list_task_id,
+        )
+        log(
+            f"auto-chain: list={list_task_id} → detail={detail_id} "
+            f"platform={platform} pending={pending}"
+        )
+
+    # ---- dispatching -------------------------------------------------------
+
+    def _dispatch(self) -> None:
+        """Pick queued tasks and launch them, one per platform at a time."""
+        platforms = ["liepin"]
+        if self.platform_filter:
+            platforms = [self.platform_filter]
+
+        for platform in platforms:
+            # Mutual exclusion
+            running = self.db.get_running_task(platform)
+            if running:
+                # Already tracked in self._running?
+                if running["task_id"] not in self._running:
+                    log(
+                        f"orphan running task={running['task_id']} "
+                        f"platform={platform} — will not re-launch"
+                    )
+                continue
+
+            # Also skip if we're already tracking something for this platform
+            already_running = any(
+                t.get("platform") == platform
+                for t_id, t in self._running.items()
+                if self._get_task_from_db(t_id)
+            )
+            # Actually just check _running against DB
+            in_memory_for_platform = False
+            for tid in self._running:
+                task = self._get_task_from_db(tid)
+                if task and task.get("platform") == platform:
+                    in_memory_for_platform = True
+                    break
+            if in_memory_for_platform:
+                continue
+
+            # Fetch next queued task
+            queued = self.db.get_queued_tasks(platform=platform, limit=1)
+            if not queued:
+                continue
+
+            task = queued[0]
+            task_type = task.get("task_type", "")
+            builder = TASK_BUILDERS.get(task_type)
+            if not builder:
+                log(f"unknown task_type={task_type} task={task['task_id']}, skipping")
+                self.db.update_task_run(task["task_id"], status="failed", error_message=f"unknown task_type={task_type}")
+                continue
+
+            cmd = builder(task)
+            log(f"launch task={task['task_id']} type={task_type} platform={platform} cmd={' '.join(cmd)}")
+
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=BASE_DIR,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception as exc:
+                log(f"launch failed task={task['task_id']} error={exc}")
+                self.db.update_task_run(task["task_id"], status="failed", error_message=str(exc))
+                continue
+
+            self._running[task["task_id"]] = proc
+            self.db.update_task_run(
+                task["task_id"],
+                status="running",
+                pid=proc.pid,
+            )
+
+    def _get_task_from_db(self, task_id: str) -> Optional[dict]:
+        for t in self.db.get_task_runs(limit=50):
+            if t["task_id"] == task_id:
+                return t
+        return None
+
+    # ---- cookie maintenance ------------------------------------------------
+
+    def _maybe_scan_cookies(self) -> None:
+        now = time.time()
+        interval = RUN_CONFIG.get("daemon_cookie_scan_interval_seconds", 300)
+        if now - self._last_cookie_scan < interval:
+            return
+        self._last_cookie_scan = now
+
+        platforms = ["liepin", "boss", "zhilian"]
+        if self.platform_filter:
+            platforms = [self.platform_filter]
+        for pf in platforms:
+            try:
+                scan_and_cleanup(platform=pf)
+            except Exception as exc:
+                log(f"cookie scan error platform={pf}: {exc}")
+
+    # ---- main loop ---------------------------------------------------------
+
+    def run_forever(self) -> None:
+        poll_interval = RUN_CONFIG.get("daemon_poll_interval_seconds", 3)
+        log(f"daemon started poll_interval={poll_interval}s")
+
+        while not self._shutdown:
+            try:
+                self._reap_finished()
+                self._dispatch()
+                self._maybe_scan_cookies()
+            except Exception as exc:
+                log(f"loop error: {exc}")
+
+            time.sleep(poll_interval)
+
+        # graceful shutdown
+        log("shutting down, waiting for running tasks...")
+        for task_id, proc in self._running.items():
+            log(f"terminating task={task_id} pid={proc.pid}")
+            try:
+                proc.terminate()
+                proc.wait(timeout=10)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        log("daemon stopped")
+
+    def shutdown(self) -> None:
+        self._shutdown = True
+
+
+# ---------------------------------------------------------------------------
+# daemonize helpers (Windows-compatible)
+# ---------------------------------------------------------------------------
+
+def _pid_file_path() -> Path:
+    name = RUN_CONFIG.get("daemon_pid_file", "crawler_daemon.pid")
+    return BASE_DIR / name
+
+
+def _write_pid(pid: int) -> None:
+    _pid_file_path().write_text(str(pid))
+
+
+def _read_pid() -> Optional[int]:
+    path = _pid_file_path()
+    if not path.exists():
+        return None
+    try:
+        return int(path.read_text().strip())
+    except (ValueError, OSError):
+        return None
+
+
+def _remove_pid() -> None:
+    path = _pid_file_path()
+    if path.exists():
+        path.unlink()
+
+
+def _is_process_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Crawler daemon")
+    parser.add_argument(
+        "--daemon", action="store_true",
+        help="Run in background (daemonize).",
+    )
+    parser.add_argument(
+        "--stop", action="store_true",
+        help="Stop a running daemon.",
+    )
+    parser.add_argument(
+        "--platform", default="",
+        help="Only manage this platform. Default: all.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    # --- stop ---
+    if args.stop:
+        pid = _read_pid()
+        if pid is None:
+            print("No daemon PID file found.")
+            raise SystemExit(0)
+        if not _is_process_running(pid):
+            print(f"PID {pid} is not running. Removing stale PID file.")
+            _remove_pid()
+            raise SystemExit(0)
+        print(f"Sending SIGTERM to pid={pid} ...")
+        os.kill(pid, signal.SIGTERM)
+        _remove_pid()
+        print("Stop signal sent.")
+        return
+
+    # --- daemonize (Windows: just detach console) ---
+    if args.daemon:
+        pid = _read_pid()
+        if pid and _is_process_running(pid):
+            print(f"Daemon already running (pid={pid}). Use --stop first.")
+            raise SystemExit(1)
+
+        # Simple daemonize: spawn self without --daemon in background
+        _write_pid(os.getpid())
+        # Redirect stdio
+        log_dir = BASE_DIR / RUN_CONFIG.get("daemon_log_dir", "logs")
+        log_dir.mkdir(exist_ok=True)
+        log_path = log_dir / "crawler_daemon.log"
+        print(f"Daemon starting. Log: {log_path}  PID: {os.getpid()}")
+        # Detach by spawning a new process
+        python = get_python()
+        script = Path(__file__).resolve()
+        subprocess.Popen(
+            [python, str(script)],
+            cwd=BASE_DIR,
+            stdout=open(str(log_path), "a"),
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+        print("Daemon launched in background.")
+        return
+
+    # --- foreground ---
+    db = Database(PATHS["database"])
+    db.init()
+
+    daemon = CrawlerDaemon(db, platform_filter=args.platform)
+
+    # Handle SIGTERM / SIGINT gracefully
+    def _handle_signal(signum, frame):
+        daemon.shutdown()
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
+    _write_pid(os.getpid())
+    try:
+        daemon.run_forever()
+    finally:
+        _remove_pid()
+
+
+if __name__ == "__main__":
+    main()

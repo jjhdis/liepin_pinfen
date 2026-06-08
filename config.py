@@ -46,6 +46,19 @@ RUN_CONFIG = {
     "cookie_max_age_days": 2,
     # 单次 rotate 最多使用几份 cookie，None 或 0 = 不限制
     "cookie_max_per_run": 3,
+    # 每批 detail 跑完后为 cookie 设置的冷却时间（小时）
+    "cookie_cooldown_hours": 2,
+    # 单个 cookie 每日最大 detail 条数上限，0 = 不限
+    "cookie_daily_max_detail": 0,
+    # --- crawler daemon ---
+    # 守护进程主循环轮询间隔（秒）
+    "daemon_poll_interval_seconds": 3,
+    # PID 文件路径
+    "daemon_pid_file": "crawler_daemon.pid",
+    # 日志目录
+    "daemon_log_dir": "logs",
+    # Cookie 自动扫描间隔（秒）
+    "daemon_cookie_scan_interval_seconds": 300,
     "list": {
         # 列表页默认从第几页开始抓，以及连续抓多少页。
         "page": 0,

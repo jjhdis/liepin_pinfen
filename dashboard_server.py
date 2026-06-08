@@ -1,11 +1,15 @@
 import argparse
 import json
 import sqlite3
+import subprocess
 import sys
+import threading
+import uuid
 from contextlib import closing
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
 from config import PATHS, RUN_CONFIG
@@ -186,6 +190,7 @@ HTML_PAGE = """<!doctype html>
       <a class="active" href="/">抓取监控</a>
       <a href="/scores">Score 结果</a>
       <a href="/cookies">Cookie 管理</a>
+      <a href="/crawl">爬虫控制</a>
     </div>
 
     <div class="grid" id="cards"></div>
@@ -547,6 +552,7 @@ SCORES_PAGE = """<!doctype html>
       <a href="/">抓取监控</a>
       <a class="active" href="/scores">Score 结果</a>
       <a href="/cookies">Cookie 管理</a>
+      <a href="/crawl">爬虫控制</a>
     </div>
 
     <div class="grid" id="cards"></div>
@@ -990,6 +996,411 @@ COOKIES_PAGE = """<!doctype html>
 """
 
 
+CRAWL_PAGE = """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Crawl Control</title>
+  <style>
+    :root {
+      --bg: #f4f0e8; --panel: #fffaf2; --line: #d9cdb8; --text: #1f1a14;
+      --muted: #6e6357; --accent: #165d52; --warn: #9a5b00; --danger: #a13131;
+      --ok: #2f6b2f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: radial-gradient(circle at top left, #efe4d3 0, transparent 28%),
+                  linear-gradient(180deg, #f7f1e7 0%, #f1eadf 100%);
+      color: var(--text);
+    }
+    .wrap { max-width: 1300px; margin: 0 auto; padding: 24px; }
+    .topbar { display: flex; justify-content: space-between; align-items: end; gap: 16px; margin-bottom: 18px; }
+    h1 { margin: 0; font-size: 30px; letter-spacing: .02em; }
+    .sub, .meta { color: var(--muted); font-size: 13px; }
+    .nav { display: flex; gap: 8px; margin: 0 0 16px 0; flex-wrap: wrap; }
+    .nav a {
+      display: inline-flex; align-items: center; padding: 8px 12px;
+      border-radius: 999px; border: 1px solid var(--line); color: var(--text);
+      text-decoration: none; background: rgba(255,250,242,.9); font-size: 13px;
+    }
+    .nav a.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+    .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }
+    .card, .panel {
+      background: rgba(255,250,242,.96); border: 1px solid var(--line);
+      border-radius: 16px; box-shadow: 0 10px 30px rgba(64, 44, 17, 0.07);
+    }
+    .card { padding: 16px; min-height: 100px; }
+    .k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+    .v { font-size: 34px; font-weight: 700; margin-top: 10px; }
+    .note { margin-top: 8px; color: var(--muted); font-size: 12px; }
+    .panel { padding: 14px; overflow: hidden; margin-bottom: 14px; }
+    .panel h2 { margin: 0 0 10px 0; font-size: 16px; }
+
+    .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+    input, select, button {
+      border: 1px solid var(--line); background: #fffdf8; color: var(--text);
+      border-radius: 10px; padding: 8px 10px; font-size: 13px;
+    }
+    button { background: var(--accent); color: #fff; border-color: var(--accent); cursor: pointer; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.danger { background: var(--danger); border-color: var(--danger); }
+
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td {
+      border-top: 1px solid #eadfce; padding: 9px 8px; text-align: left;
+      vertical-align: top; word-break: break-word;
+    }
+    thead th { border-top: none; color: var(--muted); font-size: 12px; font-weight: 600; }
+
+    .chip {
+      display: inline-flex; align-items: center; padding: 2px 9px; border-radius: 999px;
+      font-size: 12px; font-weight: 600; border: 1px solid currentColor; white-space: nowrap;
+    }
+    .chip.running { color: #7d6200; background: #fff3cc; }
+    .chip.completed { color: #245d24; background: #def6de; }
+    .chip.failed { color: #8b2222; background: #f7d8d8; }
+
+    .mono { font-family: Consolas, "Courier New", monospace; font-size: 12px; }
+    .muted { color: var(--muted); }
+    .empty { color: var(--muted); padding: 12px 2px 2px; }
+    .toast {
+      position: fixed; top: 16px; right: 16px; padding: 12px 20px; border-radius: 12px;
+      font-size: 13px; font-weight: 600; z-index: 999; opacity: 0; transition: opacity .3s;
+    }
+    .toast.show { opacity: 1; }
+    .toast.ok { background: #def6de; color: #245d24; border: 1px solid #2f6b2f; }
+    .toast.err { background: #f7d8d8; color: #8b2222; border: 1px solid #a13131; }
+    .spinner {
+      display: inline-block; width: 14px; height: 14px; border: 2px solid var(--muted);
+      border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite;
+      vertical-align: middle; margin-right: 6px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .section-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    @media (max-width: 900px) {
+      .section-row { grid-template-columns: 1fr; }
+      .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 600px) {
+      .wrap { padding: 14px; }
+      .grid { grid-template-columns: 1fr; }
+      .v { font-size: 28px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="topbar">
+      <div>
+        <h1>Crawl Control</h1>
+        <div class="sub">管理爬虫抓取任务 — 列表抓取 / 详情抓取 / 后处理</div>
+      </div>
+      <div class="meta" id="meta">loading...</div>
+    </div>
+
+    <div class="nav">
+      <a href="/">抓取监控</a>
+      <a href="/scores">Score 结果</a>
+      <a href="/cookies">Cookie 管理</a>
+      <a class="active" href="/crawl">爬虫控制</a>
+    </div>
+
+    <div class="grid" id="cards"></div>
+
+    <div class="section-row">
+      <div class="panel">
+        <h2>启动任务</h2>
+
+        <div style="margin-bottom:12px">
+          <label style="font-size:13px;color:var(--muted)">平台</label>
+          <select id="platform-select" style="width:100%;margin-top:4px">
+            <option value="liepin">liepin</option>
+          </select>
+        </div>
+
+        <div style="margin-bottom:12px">
+          <label style="font-size:13px;color:var(--muted)">Cookie 账号</label>
+          <select id="cookie-select" style="width:100%;margin-top:4px">
+            <option value="">自动选择</option>
+          </select>
+        </div>
+
+        <div style="margin-bottom:12px">
+          <label style="font-size:13px;color:var(--muted)">Keyword（仅列表抓取）</label>
+          <select id="keyword-select" style="width:100%;margin-top:4px">
+            <option value="">全部</option>
+          </select>
+        </div>
+
+        <div style="margin-bottom:12px">
+          <label style="font-size:13px;color:var(--muted)">列表抓取数量</label>
+          <select id="store-top-n" style="width:100%;margin-top:4px">
+            <option value="30">30</option>
+            <option value="40">40</option>
+          </select>
+        </div>
+
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button id="btn-list" onclick="startList()">开始列表抓取</button>
+          <button id="btn-detail" onclick="startDetail()">开始详情抓取</button>
+          <button id="btn-postprocess" onclick="startPostprocess()">后处理</button>
+        </div>
+        <div id="action-status" style="margin-top:8px;font-size:12px;color:var(--muted)"></div>
+      </div>
+
+      <div class="panel">
+        <h2>运行中的任务</h2>
+        <div id="running-table"></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>任务历史</h2>
+      <div id="tasks-table"></div>
+    </div>
+
+    <div id="toast" class="toast"></div>
+  </div>
+
+  <script>
+    const esc = (value) => {
+      if (value === null || value === undefined) return '';
+      return String(value).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#39;');
+    };
+
+    const chip = (value) => `<span class="chip ${value}">${esc(value)}</span>`;
+
+    const makeTable = (columns, rows, formatters = {}) => {
+      if (!rows || !rows.length) return '<div class="empty">暂无数据</div>';
+      const head = columns.map(c => `<th>${esc(c.label)}</th>`).join('');
+      const body = rows.map(row =>
+        `<tr>${columns.map(c => {
+          const raw = row[c.key];
+          const html = formatters[c.key] ? formatters[c.key](raw, row) : esc(raw ?? '');
+          return `<td>${html}</td>`;
+        }).join('')}</tr>`
+      ).join('');
+      return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+    };
+
+    async function getJson(url, opts = {}) {
+      const res = await fetch(url, opts);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    }
+
+    function showToast(msg, ok = true) {
+      const el = document.getElementById('toast');
+      el.textContent = msg;
+      el.className = `toast ${ok ? 'ok' : 'err'} show`;
+      setTimeout(() => { el.className = 'toast'; }, 4000);
+    }
+
+    function renderCards(data) {
+      const running = (data.active_tasks || []).filter(t => t.status === 'running').length;
+      const queued = (data.active_tasks || []).filter(t => t.status === 'queued').length;
+      const cards = [
+        ['待抓详情', data.pending_detail, 'jobs.detail_status = pending'],
+        ['待清洗', data.pending_cleaned, 'ready for clean'],
+        ['待评分', data.pending_score, 'ready for scoring'],
+        ['排队/运行', `${queued} / ${running}`, '当前活跃任务'],
+      ];
+      document.getElementById('cards').innerHTML = cards.map(([k, v, note]) => `
+        <div class="card">
+          <div class="k">${esc(k)}</div>
+          <div class="v">${esc(v)}</div>
+          <div class="note">${esc(note)}</div>
+        </div>
+      `).join('');
+    }
+
+    let _keywordsLoaded = false;
+    let _cookiesLoaded = false;
+
+    async function loadPage() {
+      const status = await getJson('/api/crawl/status');
+
+      // Lazy-load keywords & cookies once
+      if (!_keywordsLoaded) {
+        try {
+          const keywords = await getJson('/api/crawl/keywords');
+          const kwSel = document.getElementById('keyword-select');
+          kwSel.innerHTML = '<option value="">全部</option>';
+          keywords.forEach(kw => {
+            kwSel.innerHTML += `<option value="${esc(kw)}">${esc(kw)}</option>`;
+          });
+          _keywordsLoaded = true;
+        } catch(e) {}
+      }
+      if (!_cookiesLoaded) {
+        try {
+          const cookies = await getJson('/api/cookie-profiles?status=ready');
+          const sel = document.getElementById('cookie-select');
+          sel.innerHTML = '<option value="">自动选择</option>';
+          (cookies.profiles || []).forEach(p => {
+            sel.innerHTML += `<option value="${esc(p.profile_name)}">${esc(p.profile_name)} (ready)</option>`;
+          });
+          _cookiesLoaded = true;
+        } catch(e) {}
+      }
+
+      // Also load task history
+      let tasks = [];
+      try { tasks = await getJson('/api/crawl/tasks'); } catch(e) {}
+
+      renderCards(status);
+
+      // --- active tasks (queued + running) ---
+      const activeTasks = data.active_tasks || [];
+      document.getElementById('running-table').innerHTML = makeTable(
+        [
+          { key: 'task_id', label: '任务ID' },
+          { key: 'task_type', label: '类型' },
+          { key: 'status', label: '状态' },
+          { key: 'keyword', label: '关键词' },
+          { key: 'profile_name', label: '账号' },
+          { key: 'started_at', label: '开始时间' },
+          { key: '_cancel', label: '操作' },
+        ],
+        activeTasks,
+        {
+          task_type: (v) => `<span style="font-weight:600">${esc(v)}</span>`,
+          status: (v) => chip(v),
+          started_at: (v) => v ? esc(v).replace('T',' ').slice(0,16) : '-',
+          keyword: (v) => v ? esc(v) : '<span class="muted">全部</span>',
+          profile_name: (v) => v ? esc(v) : '<span class="muted">自动</span>',
+          _cancel: (v, row) => {
+            if (row.status === 'queued' || row.status === 'running') {
+              return `<button onclick="cancelTask('${esc(row.task_id)}')" style="font-size:11px;padding:4px 8px" class="danger">取消</button>`;
+            }
+            return '';
+          },
+        }
+      );
+
+      // --- task history ---
+      document.getElementById('tasks-table').innerHTML = makeTable(
+        [
+          { key: 'task_id', label: '任务ID' },
+          { key: 'platform', label: '平台' },
+          { key: 'task_type', label: '类型' },
+          { key: 'status', label: '状态' },
+          { key: 'keyword', label: '关键词' },
+          { key: 'profile_name', label: '账号' },
+          { key: 'started_at', label: '开始' },
+          { key: 'finished_at', label: '结束' },
+        ],
+        tasks,
+        {
+          status: (v) => chip(v),
+          platform: (v) => `<span class="mono">${esc(v)}</span>`,
+          task_type: (v) => `<span style="font-weight:600">${esc(v)}</span>`,
+          started_at: (v) => v ? esc(v).replace('T',' ').slice(0,16) : '-',
+          finished_at: (v) => v ? esc(v).replace('T',' ').slice(0,16) : '-',
+          keyword: (v) => v ? esc(v) : '<span class="muted">-</span>',
+          profile_name: (v) => v ? esc(v) : '<span class="muted">-</span>',
+        }
+      );
+
+      document.getElementById('meta').textContent = `自动刷新 10s | 最后刷新 ${new Date().toLocaleString()}`;
+    }
+
+    function setButtons(enabled) {
+      ['btn-list','btn-detail','btn-postprocess'].forEach(id => {
+        document.getElementById(id).disabled = !enabled;
+      });
+    }
+
+    async function startList() {
+      const platform = document.getElementById('platform-select').value;
+      const keyword = document.getElementById('keyword-select').value;
+      const profile = document.getElementById('cookie-select').value;
+      const storeTopN = document.getElementById('store-top-n').value;
+
+      if (!keyword) { showToast('请选择 keyword', false); return; }
+
+      setButtons(false);
+      document.getElementById('action-status').innerHTML = '<span class="spinner"></span>启动中...';
+      try {
+        const data = await getJson('/api/crawl/list', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ platform, keyword, cookie_profile_name: profile || undefined, store_top_n: parseInt(storeTopN) }),
+        });
+        if (data.error) { showToast(data.error, false); }
+        else { showToast(`列表抓取已启动: ${data.task_id}`); }
+      } catch (err) {
+        showToast(`请求失败: ${err.message}`, false);
+      } finally {
+        setButtons(true);
+        document.getElementById('action-status').textContent = '';
+        loadPage();
+      }
+    }
+
+    async function startDetail() {
+      const platform = document.getElementById('platform-select').value;
+      const profile = document.getElementById('cookie-select').value;
+
+      setButtons(false);
+      document.getElementById('action-status').innerHTML = '<span class="spinner"></span>启动中...';
+      try {
+        const data = await getJson('/api/crawl/detail', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ platform, cookie_profile_name: profile || undefined }),
+        });
+        if (data.error) { showToast(data.error, false); }
+        else { showToast(`详情抓取已启动: ${data.task_id}`); }
+      } catch (err) {
+        showToast(`请求失败: ${err.message}`, false);
+      } finally {
+        setButtons(true);
+        document.getElementById('action-status').textContent = '';
+        loadPage();
+      }
+    }
+
+    async function startPostprocess() {
+      setButtons(false);
+      document.getElementById('action-status').innerHTML = '<span class="spinner"></span>启动中...';
+      try {
+        const data = await getJson('/api/crawl/postprocess', { method: 'POST' });
+        if (data.error) { showToast(data.error, false); }
+        else { showToast(`后处理已启动: ${data.task_id}`); }
+      } catch (err) {
+        showToast(`请求失败: ${err.message}`, false);
+      } finally {
+        setButtons(true);
+        document.getElementById('action-status').textContent = '';
+        loadPage();
+      }
+    }
+
+    async function cancelTask(taskId) {
+      try {
+        await getJson(`/api/crawl/tasks/${encodeURIComponent(taskId)}/cancel`, { method: 'POST' });
+        showToast('任务已取消');
+        loadPage();
+      } catch(err) {
+        showToast(`取消失败: ${err.message}`, false);
+      }
+    }
+
+    setInterval(loadPage, 10000);
+    loadPage().catch(err => {
+      document.getElementById('meta').textContent = `加载失败: ${err.message}`;
+    });
+  </script>
+</body>
+</html>
+"""
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Minimal local dashboard for jobs.db")
     parser.add_argument("--host", default="127.0.0.1")
@@ -1195,8 +1606,6 @@ class DashboardData:
 
     def cookie_login(self, phone: str) -> dict:
         """Launch refresh_liepin_cookies.py in auto mode for a phone number."""
-        import subprocess
-
         script = Path(__file__).resolve().parent / "tools" / "refresh_liepin_cookies.py"
         python = sys.executable
         cmd = [python, str(script), "--phone", phone, "--auto"]
@@ -1206,6 +1615,83 @@ class DashboardData:
             "stdout": result.stdout[-500:] if result.stdout else "",
             "stderr": result.stderr[-500:] if result.stderr else "",
         }
+
+    # ------------------------------------------------------------------
+    # crawl task management (submit-only; daemon executes)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _generate_task_id() -> str:
+        return f"task_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+
+    def _submit_task(
+        self,
+        *,
+        platform: str,
+        task_type: str,
+        keyword: str = "",
+        cookie_profile_name: str = "",
+        store_top_n: int = 30,
+    ) -> dict:
+        """Write a task_runs row with status='queued'. Daemon picks it up."""
+        task_id = self._generate_task_id()
+        now = datetime.utcnow().isoformat(timespec="seconds")
+
+        db = sqlite3.connect(self.db_path)
+        try:
+            db.execute(
+                """
+                INSERT INTO task_runs (
+                    task_id, platform, task_type, status, keyword,
+                    profile_name, priority, started_at, created_at
+                ) VALUES (?, ?, ?, 'queued', ?, ?, 0, ?, ?)
+                """,
+                (task_id, platform, task_type, keyword, cookie_profile_name or None, now, now),
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        print(
+            f"[dashboard] submit task_id={task_id} type={task_type} "
+            f"platform={platform} keyword={keyword or 'ALL'}"
+        )
+        return {
+            "task_id": task_id,
+            "status": "queued",
+            "platform": platform,
+            "task_type": task_type,
+        }
+
+    def cancel_crawl_task(self, task_id: str) -> dict:
+        """Cancel a queued or running task."""
+        from storage.database import Database as Db
+        d = Db(self.db_path)
+        d.init()
+        ok = d.cancel_task(task_id)
+        if ok:
+            print(f"[dashboard] cancelled task_id={task_id}")
+            return {"task_id": task_id, "status": "cancelled"}
+        return {"error": f"Task {task_id} not found or already finished"}
+
+    @staticmethod
+    def crawl_keywords() -> list[str]:
+        from config import SEARCH_CONFIG
+        return list(SEARCH_CONFIG["keywords"])
+
+    def crawl_status_full(self) -> dict:
+        """Get crawl status (queued + running + pending counts)."""
+        from storage.database import Database as Db
+        d = Db(self.db_path)
+        d.init()
+        return d.crawl_status()
+
+    def get_task_runs_json(self, *, platform: str = "") -> list[dict]:
+        """Get task history."""
+        from storage.database import Database as Db
+        d = Db(self.db_path)
+        d.init()
+        return d.get_task_runs(platform=platform)
 
 
 def make_handler(data: DashboardData):
@@ -1238,6 +1724,19 @@ def make_handler(data: DashboardData):
                     return
                 if parsed.path == "/cookies":
                     self._html(COOKIES_PAGE)
+                    return
+                if parsed.path == "/crawl":
+                    self._html(CRAWL_PAGE)
+                    return
+                if parsed.path == "/api/crawl/status":
+                    self._json(data.crawl_status_full())
+                    return
+                if parsed.path == "/api/crawl/tasks":
+                    platform = (query.get("platform") or [""])[0]
+                    self._json(data.get_task_runs_json(platform=platform))
+                    return
+                if parsed.path == "/api/crawl/keywords":
+                    self._json(data.crawl_keywords())
                     return
                 if parsed.path == "/api/cookie-profiles":
                     self._json({
@@ -1288,6 +1787,52 @@ def make_handler(data: DashboardData):
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
             try:
+                if parsed.path == "/api/crawl/list":
+                    content_length = int(self.headers.get("Content-Length", 0))
+                    body = json.loads(self.rfile.read(content_length)) if content_length else {}
+                    platform = str(body.get("platform", "liepin")).strip()
+                    keyword = str(body.get("keyword", "")).strip()
+                    if not keyword:
+                        self._json({"error": "keyword is required"}, status=400)
+                        return
+                    cookie_profile_name = str(body.get("cookie_profile_name", "")).strip()
+                    store_top_n = int(body.get("store_top_n", 30))
+                    result = data._submit_task(
+                        platform=platform,
+                        task_type="list",
+                        keyword=keyword,
+                        cookie_profile_name=cookie_profile_name,
+                        store_top_n=store_top_n,
+                    )
+                    self._json(result)
+                    return
+                if parsed.path == "/api/crawl/detail":
+                    content_length = int(self.headers.get("Content-Length", 0))
+                    body = json.loads(self.rfile.read(content_length)) if content_length else {}
+                    platform = str(body.get("platform", "liepin")).strip()
+                    cookie_profile_name = str(body.get("cookie_profile_name", "")).strip()
+                    result = data._submit_task(
+                        platform=platform,
+                        task_type="detail",
+                        cookie_profile_name=cookie_profile_name,
+                    )
+                    self._json(result)
+                    return
+                if parsed.path == "/api/crawl/postprocess":
+                    result = data._submit_task(
+                        platform="liepin",
+                        task_type="postprocess",
+                    )
+                    self._json(result)
+                    return
+                if parsed.path.startswith("/api/crawl/tasks/") and parsed.path.endswith("/cancel"):
+                    task_id = parsed.path.split("/")[4]
+                    result = data.cancel_crawl_task(task_id)
+                    if "error" in result:
+                        self._json(result, status=404)
+                    else:
+                        self._json(result)
+                    return
                 if parsed.path == "/api/cookie-refresh":
                     result = data.cookie_scan()
                     self._json(result)
