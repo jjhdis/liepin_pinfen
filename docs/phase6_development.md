@@ -183,9 +183,9 @@ RUN_CONFIG = {
 
 | 事项 | 说明 |
 |------|------|
-| **冷却机制** | `cooldown_until` 已建字段，`rotate` 中未使用 |
-| **同日复用策略** | Phase5 实测同日复用可行，未开发正式轮换逻辑 |
-| **人工验证恢复闭环** | needs_manual_verify 后前端暂无恢复按钮 |
+| **冷却机制** | ✅ Phase7 已实现 — `mark_profile_cooldown()` + 查询时自动判断 |
+| **同日复用策略** | ✅ Phase7 已实现 — for→while 复用轮换 |
+| **人工验证恢复闭环** | ✅ 2026-06-08 已实现 — `/cookies` 页面新增"恢复"按钮 |
 
 ### 跨 Phase 遗留
 
@@ -195,12 +195,12 @@ RUN_CONFIG = {
 | 评分失败重试 | Phase3 |
 | 企业增强证据质量提升 | Phase4 |
 | 稳定性测试计划执行 | Phase5 test_plan |
-| API 封装 (Phase7) | 已记录 docs/phase7_planning.md |
+| API 封装 (Phase7) | ✅ 已实现 — crawler_daemon + dashboard API |
 
 ### 建议推进顺序
 
-1. 跑稳定性基准测试，确认单 cookie 安全边界
-2. 冷却机制 + 同日复用
-3. 人工验证恢复闭环（前端"我已验证"按钮 + 后端状态重置）
-4. API 封装（Phase7）
+1. ✅ 跑稳定性基准测试，确认单 cookie 安全边界 — 待执行
+2. ✅ 冷却机制 + 同日复用 — Phase7 已实现
+3. ✅ 人工验证恢复闭环 — 2026-06-08 已实现
+4. ✅ API 封装（Phase7）— 已实现
 5. 企业增强证据质量 + 评分重试 + 枚举标准化（各 Phase 遗留项）

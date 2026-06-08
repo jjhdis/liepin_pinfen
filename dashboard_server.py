@@ -916,6 +916,7 @@ COOKIES_PAGE = """<!doctype html>
           { key: 'detail_total_count', label: '累计详情' },
           { key: 'last_used_at', label: '最后使用' },
           { key: 'notes', label: '备注' },
+          { key: '_actions', label: '操作' },
         ],
         data.profiles,
         {
@@ -928,6 +929,12 @@ COOKIES_PAGE = """<!doctype html>
             return text.replace(/tier: (fresh|day_old|stale)/g, (_, t) =>
               `<span class="chip ${t}">${t}</span>`
             );
+          },
+          _actions: (v, row) => {
+            if (row.status === 'needs_manual_verify') {
+              return `<button onclick="recoverProfile('${esc(row.platform)}','${esc(row.profile_name)}')" style="font-size:11px;padding:4px 8px">恢复</button>`;
+            }
+            return '<span class="muted">-</span>';
           },
         }
       );
@@ -948,6 +955,25 @@ COOKIES_PAGE = """<!doctype html>
       } finally {
         btn.disabled = false;
         btn.textContent = '刷新扫描';
+      }
+    }
+
+    async function recoverProfile(platform, profileName) {
+      if (!confirm(`确认将 ${profileName} 恢复为可用状态？`)) return;
+      try {
+        const data = await getJson('/api/cookie-recover', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ platform, profile_name: profileName }),
+        });
+        if (data.ok) {
+          showToast(`${profileName} 已恢复为 ready`);
+          loadCookies();
+        } else {
+          showToast(data.error || '恢复失败', false);
+        }
+      } catch (err) {
+        showToast(`请求失败: ${err.message}`, false);
       }
     }
 
@@ -1616,6 +1642,28 @@ class DashboardData:
             "stderr": result.stderr[-500:] if result.stderr else "",
         }
 
+    def cookie_recover(self, platform: str, profile_name: str) -> dict:
+        """Reset a needs_manual_verify profile back to ready."""
+        db = sqlite3.connect(self.db_path)
+        try:
+            row = db.execute(
+                "SELECT status FROM cookie_profiles WHERE platform=? AND profile_name=?",
+                (platform, profile_name),
+            ).fetchone()
+            if not row:
+                return {"error": f"Profile {profile_name} not found"}
+            if row[0] != "needs_manual_verify":
+                return {"error": f"Profile {profile_name} is {row[0]}, not needs_manual_verify"}
+            db.execute(
+                "UPDATE cookie_profiles SET status='ready', cooldown_until=NULL, last_error=NULL, last_error_at=NULL, updated_at=? WHERE platform=? AND profile_name=?",
+                (datetime.utcnow().isoformat(timespec="seconds"), platform, profile_name),
+            )
+            db.commit()
+            print(f"[dashboard] cookie_recover platform={platform} profile={profile_name} → ready")
+            return {"ok": True, "platform": platform, "profile_name": profile_name, "status": "ready"}
+        finally:
+            db.close()
+
     # ------------------------------------------------------------------
     # crawl task management (submit-only; daemon executes)
     # ------------------------------------------------------------------
@@ -1850,6 +1898,20 @@ def make_handler(data: DashboardData):
                     if result["ok"]:
                         data.cookie_scan()
                     self._json(result)
+                    return
+                if parsed.path == "/api/cookie-recover":
+                    content_length = int(self.headers.get("Content-Length", 0))
+                    body = json.loads(self.rfile.read(content_length)) if content_length else {}
+                    platform = str(body.get("platform", "liepin")).strip()
+                    profile_name = str(body.get("profile_name", "")).strip()
+                    if not profile_name:
+                        self._json({"error": "profile_name is required"}, status=400)
+                        return
+                    result = data.cookie_recover(platform, profile_name)
+                    if "error" in result:
+                        self._json(result, status=404)
+                    else:
+                        self._json(result)
                     return
                 self._json({"error": "not found"}, status=404)
             except Exception as exc:
