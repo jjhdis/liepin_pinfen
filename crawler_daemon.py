@@ -108,7 +108,7 @@ class CrawlerDaemon:
     def __init__(self, db: Database, platform_filter: str = "") -> None:
         self.db = db
         self.platform_filter = platform_filter
-        self._running: dict[str, subprocess.Popen] = {}  # task_id → Popen
+        self._running: dict[str, dict] = {}  # task_id → {proc, task_type, platform, keyword}
         self._last_cookie_scan = 0.0
         self._shutdown = False
 
@@ -117,7 +117,8 @@ class CrawlerDaemon:
     def _reap_finished(self) -> None:
         """Check each running subprocess; update DB if it exited."""
         finished: list[str] = []
-        for task_id, proc in list(self._running.items()):
+        for task_id, entry in list(self._running.items()):
+            proc = entry["proc"]
             ret = proc.poll()
             if ret is not None:
                 status = "completed" if ret == 0 else "failed"
@@ -129,27 +130,18 @@ class CrawlerDaemon:
                 log(f"task={task_id} finished status={status} exit={ret}")
 
                 # ---- auto-chain: list → detail ----
-                if status == "completed":
-                    self._maybe_chain_detail(task_id)
+                if status == "completed" and entry.get("task_type") == "list":
+                    self._maybe_chain_detail(entry)
 
         for tid in finished:
             del self._running[tid]
 
-    def _maybe_chain_detail(self, list_task_id: str) -> None:
+    def _maybe_chain_detail(self, task_entry: dict) -> None:
         """If a list task completed, check for new pending jobs and auto-create
         a detail task."""
-        # Load the completed list task
-        tasks = self.db.get_task_runs(limit=1)
-        list_task = None
-        for t in tasks:
-            if t["task_id"] == list_task_id:
-                list_task = t
-                break
-        if not list_task or list_task.get("task_type") != "list":
-            return
-
-        platform = list_task.get("platform", "liepin")
-        keyword = list_task.get("keyword")
+        platform = task_entry.get("platform", "liepin")
+        keyword = task_entry.get("keyword")
+        list_task_id = task_entry.get("task_id", "")
 
         # Check if we already have a queued/running detail for this platform
         running = self.db.get_running_task(platform)
@@ -190,31 +182,14 @@ class CrawlerDaemon:
             platforms = [self.platform_filter]
 
         for platform in platforms:
-            # Mutual exclusion
+            # Mutual exclusion — one running task per platform
             running = self.db.get_running_task(platform)
             if running:
-                # Already tracked in self._running?
                 if running["task_id"] not in self._running:
                     log(
                         f"orphan running task={running['task_id']} "
                         f"platform={platform} — will not re-launch"
                     )
-                continue
-
-            # Also skip if we're already tracking something for this platform
-            already_running = any(
-                t.get("platform") == platform
-                for t_id, t in self._running.items()
-                if self._get_task_from_db(t_id)
-            )
-            # Actually just check _running against DB
-            in_memory_for_platform = False
-            for tid in self._running:
-                task = self._get_task_from_db(tid)
-                if task and task.get("platform") == platform:
-                    in_memory_for_platform = True
-                    break
-            if in_memory_for_platform:
                 continue
 
             # Fetch next queued task
@@ -234,29 +209,32 @@ class CrawlerDaemon:
             log(f"launch task={task['task_id']} type={task_type} platform={platform} cmd={' '.join(cmd)}")
 
             try:
+                log_dir = BASE_DIR / RUN_CONFIG.get("daemon_log_dir", "logs")
+                log_dir.mkdir(exist_ok=True)
+                task_log = open(str(log_dir / "daemon_tasks.log"), "a")
                 proc = subprocess.Popen(
                     cmd,
                     cwd=BASE_DIR,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stdout=task_log,
+                    stderr=subprocess.STDOUT,
                 )
             except Exception as exc:
                 log(f"launch failed task={task['task_id']} error={exc}")
                 self.db.update_task_run(task["task_id"], status="failed", error_message=str(exc))
                 continue
 
-            self._running[task["task_id"]] = proc
+            self._running[task["task_id"]] = {
+                "proc": proc,
+                "task_type": task_type,
+                "platform": platform,
+                "keyword": task.get("keyword"),
+                "task_id": task["task_id"],
+            }
             self.db.update_task_run(
                 task["task_id"],
                 status="running",
                 pid=proc.pid,
             )
-
-    def _get_task_from_db(self, task_id: str) -> Optional[dict]:
-        for t in self.db.get_task_runs(limit=50):
-            if t["task_id"] == task_id:
-                return t
-        return None
 
     # ---- cookie maintenance ------------------------------------------------
 
@@ -294,7 +272,8 @@ class CrawlerDaemon:
 
         # graceful shutdown
         log("shutting down, waiting for running tasks...")
-        for task_id, proc in self._running.items():
+        for task_id, entry in self._running.items():
+            proc = entry["proc"]
             log(f"terminating task={task_id} pid={proc.pid}")
             try:
                 proc.terminate()

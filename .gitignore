@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual env
+.venv/
+
+# Runtime files
+*.pid
+logs/
+
+# Database temp files
+*.db-shm
+*.db-wal
+
+# Debug artifacts
+debug/*.html
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
