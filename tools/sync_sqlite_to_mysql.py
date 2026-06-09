@@ -32,6 +32,26 @@ _project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_project_root))
 
 
+def _load_dotenv() -> None:
+    """从项目根 .env 文件加载环境变量（不覆盖已有变量）。"""
+    dotenv_path = _project_root / ".env"
+    if not dotenv_path.exists():
+        return
+    with dotenv_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip("\"'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+_load_dotenv()
+
+
 def get_mysql_config() -> dict[str, Any]:
     missing: list[str] = []
     for key in ("MYSQL_HOST", "MYSQL_USER", "MYSQL_PASSWORD", "MYSQL_DATABASE"):
