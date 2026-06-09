@@ -80,9 +80,15 @@ def main() -> None:
 
     scorer = JobScorer()
     success_count = 0
+    failed_count = 0
     for item in jobs:
         job_input = build_score_input(item)
-        score = scorer.score_job(job_input)
+        try:
+            score = scorer.score_job(job_input)
+        except Exception as exc:
+            failed_count += 1
+            print(f"[score-failed] job_id={item['job_id']} error={exc}")
+            continue
         score["job_id"] = item["job_id"]
         database.upsert_score(score)
         success_count += 1
@@ -93,6 +99,7 @@ def main() -> None:
 
     print(
         f"[score-summary] selected={len(jobs)} scored={success_count} "
+        f"failed={failed_count} "
         f"remaining={database.ready_for_scoring_count(keyword=args.keyword, max_days_since_update=AI_CONFIG['max_days_since_update'])}"
     )
 

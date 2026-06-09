@@ -444,6 +444,27 @@ def main() -> None:
     db = Database(PATHS["database"])
     db.init()
 
+    # 启动时清理过期数据
+    retention = RUN_CONFIG["data_retention_days"]
+    deleted = db.cleanup_old_records(retention_days=retention)
+    cleaned = [(t, n) for t, n in deleted.items() if n]
+    if cleaned:
+        print(f"[daemon] cleanup (>{retention}d): " + ", ".join(f"{t}={n}" for t, n in cleaned))
+    else:
+        print(f"[daemon] cleanup (>{retention}d): nothing to delete")
+
+    # 清理 debug 目录过期文件
+    debug_dir = PATHS["debug"]
+    if debug_dir.exists():
+        cutoff = time.time() - retention * 86400
+        debug_deleted = 0
+        for f in debug_dir.iterdir():
+            if f.is_file() and f.stat().st_mtime < cutoff:
+                f.unlink()
+                debug_deleted += 1
+        if debug_deleted:
+            print(f"[daemon] cleanup debug/: {debug_deleted} files deleted")
+
     daemon = CrawlerDaemon(db, platform_filter=args.platform)
 
     # Handle SIGTERM / SIGINT gracefully

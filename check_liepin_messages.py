@@ -258,6 +258,14 @@ def request_contact_page(
     raise last_error
 
 
+def _clean_preview_text(text: str) -> str:
+    """Remove noise symbols from message preview text."""
+    text = re.sub(r">+", " ", text)
+    text = re.sub(r"【.*?】", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 def extract_message_preview(last_payload_raw: Any) -> str:
     if not last_payload_raw:
         return ""
@@ -269,7 +277,7 @@ def extract_message_preview(last_payload_raw: Any) -> str:
     try:
         payload = json.loads(text)
     except json.JSONDecodeError:
-        return text[:200]
+        return _clean_preview_text(text[:200])
 
     bodies = payload.get("bodies")
     if isinstance(bodies, list):
@@ -281,7 +289,7 @@ def extract_message_preview(last_payload_raw: Any) -> str:
             if msg:
                 parts.append(msg)
         if parts:
-            return " ".join(parts)[:200]
+            return _clean_preview_text(" ".join(parts)[:200])
 
     ext_body = (
         payload.get("ext", {})
@@ -291,12 +299,12 @@ def extract_message_preview(last_payload_raw: Any) -> str:
     if isinstance(ext_body, dict):
         list_content = str(ext_body.get("listContent") or "").strip()
         if list_content:
-            return list_content[:200]
+            return _clean_preview_text(list_content[:200])
         content = str(ext_body.get("content") or "").strip()
         if content:
-            return content[:200]
+            return _clean_preview_text(content[:200])
 
-    return text[:200]
+    return _clean_preview_text(text[:200])
 
 
 def normalize_contact(raw_item: dict[str, Any], *, checked_at: str) -> dict[str, Any]:

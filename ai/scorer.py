@@ -1,4 +1,5 @@
 import json
+import time
 from datetime import datetime
 from typing import Any
 
@@ -6,7 +7,7 @@ import httpx
 from openai import OpenAI
 
 from config import AI_CONFIG
-from ai.parser import parse_and_validate_score
+from ai.parser import ScoreValidationError, parse_and_validate_score
 from ai.prompts import PROMPT_VERSION, SYSTEM_PROMPT, build_user_prompt
 
 
@@ -29,8 +30,29 @@ class JobScorer:
         self.model = AI_CONFIG["model"]
         self.temperature = AI_CONFIG["temperature"]
         self.max_tokens = AI_CONFIG["max_tokens"]
+        self.max_retries = AI_CONFIG["max_retries"]
+        self.retry_delay = AI_CONFIG["retry_delay_seconds"]
 
     def score_job(self, job_input: dict[str, Any]) -> dict[str, Any]:
+        last_error: Exception | None = None
+        for attempt in range(1, 1 + self.max_retries):
+            try:
+                return self._call_api(job_input)
+            except ScoreValidationError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                if attempt < self.max_retries:
+                    print(
+                        f"[score-retry] attempt={attempt}/{self.max_retries} "
+                        f"error={exc}"
+                    )
+                    time.sleep(self.retry_delay)
+        raise RuntimeError(
+            f"scoring failed after {self.max_retries} retries: {last_error}"
+        )
+
+    def _call_api(self, job_input: dict[str, Any]) -> dict[str, Any]:
         payload = json.dumps(job_input, ensure_ascii=False, indent=2)
         response = self.client.chat.completions.create(
             model=self.model,

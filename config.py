@@ -48,6 +48,8 @@ RUN_CONFIG = {
     "cookie_max_per_run": 3,
     # 每批 detail 跑完后为 cookie 设置的冷却时间（小时）
     "cookie_cooldown_hours": 2,
+    # 数据库记录保留天数，超过自动清理（cookie_profiles 除外）
+    "data_retention_days": 30,
     # 单个 cookie 每日最大 detail 条数上限，0 = 不限
     "cookie_daily_max_detail": 0,
     # --- crawler daemon ---
@@ -178,6 +180,8 @@ AI_CONFIG = {
     "temperature": 0.1,
     "max_tokens": 900,
     "request_timeout_seconds": 120.0,
+    "max_retries": 3,
+    "retry_delay_seconds": 3.0,
     "batch_size": 50,
     "max_days_since_update": 14,
 }

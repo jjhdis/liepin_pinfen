@@ -1248,6 +1248,60 @@ class Database:
                 )
             conn.commit()
 
+    def cleanup_old_records(self, *, retention_days: int = 30) -> dict[str, int]:
+        """Delete records older than retention_days from all tables except cookie_profiles."""
+        tables = [
+            ("jobs", "created_at"),
+            ("jobs_cleaned", "cleaned_at"),
+            ("scores", "scored_at"),
+            ("company_enriched", "last_checked_at"),
+            ("crawl_log", "created_at"),
+            ("task_runs", "created_at"),
+            ("message_contacts", "latest_msg_time"),
+            ("account_message_status", "checked_at"),
+        ]
+        results: dict[str, int] = {}
+        with closing(self.connect()) as conn:
+            for table, col in tables:
+                cursor = conn.execute(
+                    f"DELETE FROM {table} WHERE {col} < date('now', '-{int(retention_days)} days')"
+                )
+                results[table] = cursor.rowcount
+            conn.commit()
+        return results
+
+    def get_message_contacts(
+        self,
+        *,
+        platform: str,
+        cookie_profile_id: str,
+    ) -> list[dict[str, Any]]:
+        with closing(self.connect()) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT name, title, last_message_preview, unread_cnt,
+                       latest_msg_time, company, contact_id
+                FROM message_contacts
+                WHERE platform = ?
+                  AND cookie_profile_id = ?
+                  AND unread_cnt > 0
+                ORDER BY latest_msg_time DESC
+                """,
+                (platform, cookie_profile_id),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def delete_old_message_contacts(self, *, before_days: int = 7) -> int:
+        with closing(self.connect()) as conn:
+            cursor = conn.execute(
+                f"DELETE FROM message_contacts "
+                f"WHERE latest_msg_time < date('now', '-{int(before_days)} days')"
+            )
+            deleted = cursor.rowcount
+            conn.commit()
+            return deleted
+
     # ------------------------------------------------------------------
     # cookie_profiles
     # ------------------------------------------------------------------

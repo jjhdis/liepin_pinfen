@@ -191,6 +191,7 @@ HTML_PAGE = """<!doctype html>
       <a href="/scores">Score 结果</a>
       <a href="/cookies">Cookie 管理</a>
       <a href="/crawl">爬虫控制</a>
+      <a href="/messages">HR消息</a>
     </div>
 
     <div class="grid" id="cards"></div>
@@ -553,6 +554,7 @@ SCORES_PAGE = """<!doctype html>
       <a class="active" href="/scores">Score 结果</a>
       <a href="/cookies">Cookie 管理</a>
       <a href="/crawl">爬虫控制</a>
+      <a href="/messages">HR消息</a>
     </div>
 
     <div class="grid" id="cards"></div>
@@ -812,6 +814,8 @@ COOKIES_PAGE = """<!doctype html>
       <a href="/">抓取监控</a>
       <a href="/scores">Score 结果</a>
       <a class="active" href="/cookies">Cookie 管理</a>
+      <a href="/crawl">爬虫控制</a>
+      <a href="/messages">HR消息</a>
     </div>
 
     <div class="grid" id="cards"></div>
@@ -1135,6 +1139,7 @@ CRAWL_PAGE = """<!doctype html>
       <a href="/scores">Score 结果</a>
       <a href="/cookies">Cookie 管理</a>
       <a class="active" href="/crawl">爬虫控制</a>
+      <a href="/messages">HR消息</a>
     </div>
 
     <div class="grid" id="cards"></div>
@@ -1427,6 +1432,286 @@ CRAWL_PAGE = """<!doctype html>
     }
 
     setInterval(loadPage, 10000);
+    loadPage().catch(err => {
+      document.getElementById('meta').textContent = `加载失败: ${err.message}`;
+    });
+  </script>
+</body>
+</html>
+"""
+
+
+MESSAGES_PAGE = """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HR Messages</title>
+  <style>
+    :root {
+      --bg: #f4f0e8; --panel: #fffaf2; --line: #d9cdb8; --text: #1f1a14;
+      --muted: #6e6357; --accent: #165d52; --warn: #9a5b00; --danger: #a13131;
+      --ok: #2f6b2f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: radial-gradient(circle at top left, #efe4d3 0, transparent 28%),
+                  linear-gradient(180deg, #f7f1e7 0%, #f1eadf 100%);
+      color: var(--text);
+    }
+    .wrap { max-width: 1300px; margin: 0 auto; padding: 24px; }
+    .topbar { display: flex; justify-content: space-between; align-items: end; gap: 16px; margin-bottom: 18px; }
+    h1 { margin: 0; font-size: 30px; letter-spacing: .02em; }
+    .sub, .meta { color: var(--muted); font-size: 13px; }
+    .nav { display: flex; gap: 8px; margin: 0 0 16px 0; flex-wrap: wrap; }
+    .nav a {
+      display: inline-flex; align-items: center; padding: 8px 12px;
+      border-radius: 999px; border: 1px solid var(--line); color: var(--text);
+      text-decoration: none; background: rgba(255,250,242,.9); font-size: 13px;
+    }
+    .nav a.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+    .card, .panel {
+      background: rgba(255,250,242,.96); border: 1px solid var(--line);
+      border-radius: 16px; box-shadow: 0 10px 30px rgba(64, 44, 17, 0.07);
+    }
+    .card { padding: 16px; min-height: 80px; }
+    .k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+    .v { font-size: 34px; font-weight: 700; margin-top: 10px; }
+    .note { margin-top: 8px; color: var(--muted); font-size: 12px; }
+    .panel { padding: 14px; overflow: hidden; margin-bottom: 14px; }
+    .panel h2 { margin: 0 0 10px 0; font-size: 16px; }
+
+    .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+    input, select, button {
+      border: 1px solid var(--line); background: #fffdf8; color: var(--text);
+      border-radius: 10px; padding: 8px 10px; font-size: 13px;
+    }
+    button { background: var(--accent); color: #fff; border-color: var(--accent); cursor: pointer; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td {
+      border-top: 1px solid #eadfce; padding: 9px 8px; text-align: left;
+      vertical-align: top; word-break: break-word;
+    }
+    thead th { border-top: none; color: var(--muted); font-size: 12px; font-weight: 600; }
+
+    .hint { font-size: 12px; margin-left: 8px; }
+    .hint.warn { color: var(--danger); }
+
+    .mono { font-family: Consolas, "Courier New", monospace; font-size: 12px; }
+    .muted { color: var(--muted); }
+    .empty { color: var(--muted); padding: 12px 2px 2px; }
+    .toast {
+      position: fixed; top: 16px; right: 16px; padding: 12px 20px; border-radius: 12px;
+      font-size: 13px; font-weight: 600; z-index: 999; opacity: 0; transition: opacity .3s;
+    }
+    .toast.show { opacity: 1; }
+    .toast.ok { background: #def6de; color: #245d24; border: 1px solid #2f6b2f; }
+    .toast.err { background: #f7d8d8; color: #8b2222; border: 1px solid #a13131; }
+
+    @media (max-width: 700px) {
+      .wrap { padding: 14px; }
+      .v { font-size: 28px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="topbar">
+      <div>
+        <h1>HR 消息管理</h1>
+        <div class="sub">查看猎聘 HR 未读消息，支持一键刷新</div>
+      </div>
+      <div class="meta" id="meta">loading...</div>
+    </div>
+
+    <div class="nav">
+      <a href="/">抓取监控</a>
+      <a href="/scores">Score 结果</a>
+      <a href="/cookies">Cookie 管理</a>
+      <a href="/crawl">爬虫控制</a>
+      <a class="active" href="/messages">HR消息</a>
+    </div>
+
+    <div class="panel">
+      <h2>查询条件</h2>
+      <div class="controls">
+        <select id="platform-select">
+          <option value="liepin">liepin</option>
+        </select>
+        <select id="phone-select">
+          <option value="">-- 选择手机号 --</option>
+        </select>
+        <span id="no-cookie-hint" class="hint warn" style="display:none">该平台没有可用 Cookie，请先在 Cookie 管理页添加</span>
+        <button id="query-btn" onclick="doQuery()">查询</button>
+        <button id="refresh-btn" onclick="doRefresh()" disabled>刷新</button>
+      </div>
+    </div>
+
+    <div id="cards" style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:16px"></div>
+
+    <div class="panel">
+      <h2>未读消息列表</h2>
+      <div id="contacts-table"></div>
+    </div>
+
+    <div id="toast" class="toast"></div>
+  </div>
+
+  <script>
+    const esc = (value) => {
+      if (value === null || value === undefined) return '';
+      return String(value).replaceAll('&','&amp;').replaceAll('<','&lt;')
+        .replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#39;');
+    };
+
+    const makeTable = (columns, rows, formatters = {}) => {
+      if (!rows || !rows.length) return '<div class="empty">暂无未读消息</div>';
+      const head = columns.map(c => `<th>${esc(c.label)}</th>`).join('');
+      const body = rows.map(row =>
+        `<tr>${columns.map(c => {
+          const raw = row[c.key];
+          const html = formatters[c.key] ? formatters[c.key](raw, row) : esc(raw ?? '');
+          return `<td>${html}</td>`;
+        }).join('')}</tr>`
+      ).join('');
+      return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+    };
+
+    async function getJson(url, opts = {}) {
+      const res = await fetch(url, opts);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    }
+
+    function showToast(msg, ok = true) {
+      const el = document.getElementById('toast');
+      el.textContent = msg;
+      el.className = `toast ${ok ? 'ok' : 'err'} show`;
+      setTimeout(() => { el.className = 'toast'; }, 4000);
+    }
+
+    function fmtTime(v) {
+      if (!v) return '<span class="muted">-</span>';
+      return esc(v).replace('T', ' ').slice(0, 16);
+    }
+
+    async function loadPage() {
+      // Load cookie profiles for phone dropdown
+      const platform = document.getElementById('platform-select').value;
+      try {
+        const data = await getJson(`/api/cookie-profiles?platform=${encodeURIComponent(platform)}`);
+        const sel = document.getElementById('phone-select');
+        const hint = document.getElementById('no-cookie-hint');
+        const profiles = data.profiles || [];
+        sel.innerHTML = '<option value="">-- 选择手机号 --</option>';
+        if (profiles.length) {
+          profiles.forEach(p => {
+            sel.innerHTML += `<option value="${esc(p.profile_name)}">${esc(p.profile_name)} (${esc(p.status)})</option>`;
+          });
+          hint.style.display = 'none';
+        } else {
+          hint.style.display = 'inline';
+        }
+      } catch(e) {}
+
+      document.getElementById('meta').textContent = `自动刷新 30s | 最后刷新 ${new Date().toLocaleString()}`;
+    }
+
+    async function doQuery() {
+      const platform = document.getElementById('platform-select').value;
+      const profile = document.getElementById('phone-select').value;
+      if (!profile) { showToast('请先选择手机号', false); return; }
+
+      document.getElementById('refresh-btn').disabled = false;
+      document.getElementById('refresh-btn').dataset.platform = platform;
+      document.getElementById('refresh-btn').dataset.profile = profile;
+
+      const contacts = await getJson(
+        `/api/message-contacts?platform=${encodeURIComponent(platform)}&profile_id=${encodeURIComponent(profile)}`
+      );
+
+      const unreadTotal = contacts.reduce((s, c) => s + (c.unread_cnt || 0), 0);
+      const latest = contacts.length ? contacts[0] : null;
+
+      const cards = [
+        ['联系人', contacts.length, '有未读消息的 HR 数'],
+        ['未读消息', unreadTotal, '未读消息总数'],
+        ['最新消息', latest ? fmtTimeRaw(latest.latest_msg_time) : '-', latest ? esc(latest.name || '') : ''],
+      ];
+      document.getElementById('cards').innerHTML = cards.map(([k, v, note]) => `
+        <div class="card">
+          <div class="k">${esc(k)}</div>
+          <div class="v">${esc(v)}</div>
+          <div class="note">${esc(note)}</div>
+        </div>
+      `).join('');
+
+      document.getElementById('contacts-table').innerHTML = makeTable(
+        [
+          { key: 'name', label: 'HR姓名' },
+          { key: 'title', label: '职位' },
+          { key: 'last_message_preview', label: '最新消息预览' },
+          { key: 'unread_cnt', label: '未读' },
+          { key: 'latest_msg_time', label: '消息时间' },
+        ],
+        contacts,
+        {
+          name: (v, row) => {
+            if (!v && !row.company) return '<span class="muted">-</span>';
+            let html = v ? `<strong>${esc(v)}</strong>` : '<span class="muted">-</span>';
+            if (row.company) html += ` <span class="muted">@${esc(row.company)}</span>`;
+            return html;
+          },
+          last_message_preview: (v) => {
+            const text = esc(v || '');
+            return text.length > 60 ? `${text.slice(0, 60)}...` : (text || '<span class="muted">-</span>');
+          },
+          unread_cnt: (v) => `<strong style="color:var(--danger)">${esc(v)}</strong>`,
+          latest_msg_time: (v) => fmtTime(v),
+        }
+      );
+    }
+
+    function fmtTimeRaw(v) {
+      if (!v) return '-';
+      return v.replace('T', ' ').slice(0, 16);
+    }
+
+    async function doRefresh() {
+      const btn = document.getElementById('refresh-btn');
+      const platform = btn.dataset.platform;
+      const profile = btn.dataset.profile;
+      if (!platform || !profile) { showToast('请先选择手机号并查询', false); return; }
+
+      btn.disabled = true;
+      btn.textContent = '刷新中...';
+      try {
+        const data = await getJson('/api/message-refresh', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ platform, profile_name: profile }),
+        });
+        if (data.ok) {
+          showToast(`刷新成功: ${data.contacts} 个联系人, ${data.unread} 条未读, 清理 ${data.deleted_old} 条旧数据`);
+          await doQuery();
+        } else {
+          showToast(data.error || '刷新失败', false);
+        }
+      } catch (err) {
+        showToast(`请求失败: ${err.message}`, false);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '刷新';
+      }
+    }
+
+    document.getElementById('platform-select').addEventListener('change', loadPage);
+    setInterval(loadPage, 30000);
     loadPage().catch(err => {
       document.getElementById('meta').textContent = `加载失败: ${err.message}`;
     });
@@ -1750,6 +2035,74 @@ class DashboardData:
         d.init()
         return d.get_task_runs(platform=platform)
 
+    # ------------------------------------------------------------------
+    # HR message contacts
+    # ------------------------------------------------------------------
+
+    def message_contacts(
+        self, *, platform: str, cookie_profile_id: str
+    ) -> list[dict]:
+        from storage.database import Database as Db
+        d = Db(self.db_path)
+        d.init()
+        return d.get_message_contacts(
+            platform=platform,
+            cookie_profile_id=cookie_profile_id,
+        )
+
+    def message_refresh(
+        self, *, platform: str, profile_name: str
+    ) -> dict:
+        """Run check_liepin_messages.py for a given profile and clean old data."""
+        from storage.database import Database as Db
+
+        # Find cookie file matching the profile
+        cookie_dir = PATHS["cookie_dir"]
+        cookie_files = sorted(
+            cookie_dir.glob(f"cookie_*_{profile_name}_{platform}.json"),
+            reverse=True,
+        )
+        if not cookie_files:
+            return {
+                "ok": False,
+                "error": f"No cookie file found for {profile_name} ({platform})",
+            }
+        cookie_path = cookie_files[0]
+
+        # Run the script
+        script = Path(__file__).resolve().parent / "check_liepin_messages.py"
+        python = sys.executable
+        result = subprocess.run(
+            [python, str(script), "--cookie-file", str(cookie_path)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode != 0:
+            return {
+                "ok": False,
+                "error": result.stderr.strip()[-300:] or result.stdout.strip()[-300:] or "unknown error",
+            }
+
+        # Clean old data
+        d = Db(self.db_path)
+        d.init()
+        deleted = d.delete_old_message_contacts(before_days=7)
+
+        # Count current unread
+        contacts = d.get_message_contacts(
+            platform=platform,
+            cookie_profile_id=profile_name,
+        )
+        unread_total = sum(c.get("unread_cnt", 0) for c in contacts)
+
+        return {
+            "ok": True,
+            "contacts": len(contacts),
+            "unread": unread_total,
+            "deleted_old": deleted,
+        }
+
 
 def make_handler(data: DashboardData):
     class Handler(BaseHTTPRequestHandler):
@@ -1784,6 +2137,9 @@ def make_handler(data: DashboardData):
                     return
                 if parsed.path == "/crawl":
                     self._html(CRAWL_PAGE)
+                    return
+                if parsed.path == "/messages":
+                    self._html(MESSAGES_PAGE)
                     return
                 if parsed.path == "/api/crawl/status":
                     self._json(data.crawl_status_full())
@@ -1832,6 +2188,22 @@ def make_handler(data: DashboardData):
                             verdict=(query.get("verdict") or [""])[0],
                             detail_status=(query.get("detail_status") or [""])[0],
                             keyword=(query.get("keyword") or [""])[0],
+                        )
+                    )
+                    return
+                if parsed.path == "/api/message-contacts":
+                    platform = (query.get("platform") or [""])[0]
+                    profile_id = (query.get("profile_id") or [""])[0]
+                    if not platform or not profile_id:
+                        self._json(
+                            {"error": "platform and profile_id are required"},
+                            status=400,
+                        )
+                        return
+                    self._json(
+                        data.message_contacts(
+                            platform=platform,
+                            cookie_profile_id=profile_id,
                         )
                     )
                     return
@@ -1919,6 +2291,26 @@ def make_handler(data: DashboardData):
                     result = data.cookie_recover(platform, profile_name)
                     if "error" in result:
                         self._json(result, status=404)
+                    else:
+                        self._json(result)
+                    return
+                if parsed.path == "/api/message-refresh":
+                    content_length = int(self.headers.get("Content-Length", 0))
+                    body = json.loads(self.rfile.read(content_length)) if content_length else {}
+                    platform = str(body.get("platform", "")).strip()
+                    profile_name = str(body.get("profile_name", "")).strip()
+                    if not platform or not profile_name:
+                        self._json(
+                            {"error": "platform and profile_name are required"},
+                            status=400,
+                        )
+                        return
+                    result = data.message_refresh(
+                        platform=platform,
+                        profile_name=profile_name,
+                    )
+                    if "error" in result:
+                        self._json(result, status=400)
                     else:
                         self._json(result)
                     return
